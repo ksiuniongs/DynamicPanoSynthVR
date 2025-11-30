@@ -1,9 +1,19 @@
-echo Fetching code from github...
-svn export --force https://github.com/google-research/google-research/trunk/single_view_mpi
+#!/bin/bash
+
+echo "Fetching code from github..."
+# Use git sparse-checkout to download only the single_view_mpi directory
+git clone --no-checkout --depth=1 https://github.com/google-research/google-research.git temp_repo
+cd temp_repo
+git sparse-checkout init
+git sparse-checkout set single_view_mpi
+git checkout
+mv single_view_mpi ../
+cd ..
+rm -rf temp_repo
 
 echo
-echo Fetching trained model weights...
-rm single_view_mpi_full_keras.tar.gz
+echo "Fetching trained model weights..."
+rm -f single_view_mpi_full_keras.tar.gz
 rm -rf single_view_mpi_full
 wget https://storage.googleapis.com/stereo-magnification-public-files/models/single_view_mpi_full_keras.tar.gz
 tar -xzvf single_view_mpi_full_keras.tar.gz

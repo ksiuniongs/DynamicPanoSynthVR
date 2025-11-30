@@ -1,0 +1,2 @@
+model_checkpoint_path: "single_view_mpi_keras_weights"
+all_model_checkpoint_paths: "single_view_mpi_keras_weights"
