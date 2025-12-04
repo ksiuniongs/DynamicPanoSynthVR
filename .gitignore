@@ -139,4 +139,8 @@ docs/assets*
 intermediate
 
 result
-output/
+output/# Large files
+*.mp4
+campus360*.mp4
+output/*/input/atlas.png
+assets/output_atlas_video.mp4
