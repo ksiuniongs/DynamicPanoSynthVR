@@ -66,32 +66,44 @@ def cmd_extract(args):
 
     pbar = tqdm(total=total_frames, unit="frame")
 
+    pending_frame = None
+    last_mask = None
+
     while True:
         if args.max_frames != -1 and frame_idx >= args.max_frames:
             break
 
         if frame_idx % args.frame_interval == 0:
-            flow_max = 0.0
-            if frame_idx == 0:
-                mask = np.zeros(current.shape[:2], dtype=np.uint8)
-                raw_px = 0
-                final_px = 0
+            if pending_frame is None:
+                # First frame encountered (e.g. frame 0)
+                # We defer processing until we have the next frame to compute flow
+                pending_frame = (frame_idx, current.copy())
             else:
-                mask, flow_max = segmenter.compute_mask(prev_for_flow, current)
-                raw_px = np.count_nonzero(mask)
+                # We have a pending frame (prev) and current frame (curr)
+                prev_idx, prev_img = pending_frame
+                
+                # Compute mask for prev_img based on flow to current
+                # flow(prev -> curr) gives a mask aligned with prev
+                mask, flow_max = segmenter.compute_mask(prev_img, current)
+                
                 mask = clean_mask(mask, args.mask_kernel)
+                last_mask = mask
+                
+                # Process and save the PENDING frame
+                background = inpaint_background(prev_img, mask, args.inpaint_radius)
+                frame_name = to_frame_name(prev_idx)
+                
+                cv2.imwrite(str(bg_dir / f"{frame_name}.png"), background)
+                cv2.imwrite(str(mask_dir / f"{frame_name}.png"), mask)
+                if args.save_foreground:
+                    save_foreground(prev_img, mask, fg_dir / f"{frame_name}.png")
+                
+                raw_px = np.count_nonzero(mask)
                 final_px = np.count_nonzero(mask)
-
-            background = inpaint_background(current, mask, args.inpaint_radius)
-
-            frame_name = to_frame_name(frame_idx)
-            cv2.imwrite(str(bg_dir / f"{frame_name}.png"), background)
-            cv2.imwrite(str(mask_dir / f"{frame_name}.png"), mask)
-            if args.save_foreground:
-                save_foreground(current, mask, fg_dir / f"{frame_name}.png")
-
-            pbar.set_postfix(max_flow=f"{flow_max:.2f}", raw_px=raw_px, final_px=final_px)
-            prev_for_flow = current.copy()
+                pbar.set_postfix(max_flow=f"{flow_max:.2f}", raw_px=raw_px, final_px=final_px)
+                
+                # Update pending frame to be the current one
+                pending_frame = (frame_idx, current.copy())
         
         pbar.update(1)
 
@@ -100,6 +112,23 @@ def cmd_extract(args):
         if not ret:
             break
         current = cv2.resize(next_frame, (args.width, args.height))
+
+    # Process the final pending frame if it exists
+    if pending_frame is not None:
+        idx, img = pending_frame
+        if last_mask is None:
+            # Only one frame in video or no flow computed yet
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+        else:
+            # Reuse the last known mask for the final frame
+            mask = last_mask
+            
+        background = inpaint_background(img, mask, args.inpaint_radius)
+        frame_name = to_frame_name(idx)
+        cv2.imwrite(str(bg_dir / f"{frame_name}.png"), background)
+        cv2.imwrite(str(mask_dir / f"{frame_name}.png"), mask)
+        if args.save_foreground:
+            save_foreground(img, mask, fg_dir / f"{frame_name}.png")
 
     pbar.close()
     cap.release()
