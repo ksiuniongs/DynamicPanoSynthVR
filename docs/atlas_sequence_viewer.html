@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Atlas Sequence Viewer</title>
+    <link type="text/css" rel="stylesheet" href="./assets/main.css" />
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+        }
+
+        #status {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.45);
+            padding: 6px 10px;
+            font-family: monospace;
+            font-size: 13px;
+            border-radius: 4px;
+            pointer-events: none;
+            user-select: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="container"></div>
+    <div id="status">Loading manifest…</div>
+
+    <script id="mpiVertexShader" type="x-shader/x-vertex">
+        varying highp vec2 vUv;
+        uniform mat3 vUvTransform;
+        void main() {
+            vUv = (vUvTransform * vec3(uv.x, uv.y, 1.0)).xy;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+        }
+    </script>
+    <script id="mpiFragmentShader" type="x-shader/x-fragment">
+        uniform sampler2D tColor;
+        varying highp vec2 vUv;
+        void main() {
+            vec4 rgba = texture2D(tColor, vUv);
+            gl_FragColor = rgba;
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from './assets/js/three.module.js';
+        import { VRButton } from './assets/js/VRButton.js';
+
+        const statusEl = document.getElementById('status');
+
+        function parseQuery() {
+            const params = {};
+            window.location.search.replace(/([^?=&]+)(=([^&]*))?/g, (_, key, __, value) => {
+                params[key] = value;
+            });
+            return params;
+        }
+
+        const params = parseQuery();
+        const sceneName = params['scene'] || 'input';
+        const manifestName = params['manifest'] || 'frames_manifest.json';
+        const foregroundManifestName = params['foreground_manifest'];
+        const fps = Math.max(1, parseFloat(params['fps']) || 30);
+        const shouldLoop = params['loop'] !== 'false';
+        const cacheSize = Math.max(2, parseInt(params['cache']) || 24);
+        const startIndex = Math.max(0, parseInt(params['start']) || 0);
+        const frameStep = Math.max(1, parseInt(params['frame_step'] || '1'));
+
+        const manifestUrl = `./assets/${sceneName}/${manifestName}`;
+        const foregroundDepthScale = parseFloat(params['foreground_depth'] || '1.02');
+        const backgroundStatic = params['bg_static'] === 'true';
+        const bgFrameParam = params['bg_frame'] ? parseInt(params['bg_frame'], 10) : 0;
+        let staticBackgroundIndex = isNaN(bgFrameParam) ? 0 : bgFrameParam;
+        const frameDuration = 1.0 / fps;
+
+        const loader = new THREE.TextureLoader();
+        loader.setCrossOrigin('anonymous');
+
+        const cachedTextures = new Map();
+        const loadingPromises = new Map();
+        const foregroundCache = new Map();
+        const foregroundPending = new Map();
+        const lru = [];
+
+        let renderer, scene, camera, parentGroup, clock;
+        let backgroundGroup = null;
+        let foregroundGroup = null;
+        let backgroundTexture = null;
+        let frames = [];
+        let basePath = '';
+        let foregroundFrames = [];
+        let foregroundBasePath = '';
+        let currentFrame = startIndex;
+        let displayedFrameIndex = -1;
+        let accumulator = 0;
+        let playbackActive = true;
+
+        async function loadManifest() {
+            const response = await fetch(manifestUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch manifest: ${response.status} ${response.statusText}`);
+            }
+            const json = await response.json();
+            if (!Array.isArray(json.frames) || json.frames.length === 0) {
+                throw new Error('Manifest must contain a non-empty "frames" array');
+            }
+            frames = json.frames;
+            basePath = json.basePath ? json.basePath.replace(/\/$/, '') + '/' : '';
+            staticBackgroundIndex = Math.min(Math.max(staticBackgroundIndex, 0), frames.length - 1);
+        }
+
+        async function loadForegroundManifest() {
+            if (!foregroundManifestName) return;
+            const url = `./assets/${sceneName}/${foregroundManifestName}`;
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch foreground manifest: ${response.status} ${response.statusText}`);
+            }
+            const json = await response.json();
+            if (!Array.isArray(json.frames) || json.frames.length === 0) {
+                console.warn('Foreground manifest is empty, ignoring foreground atlas.');
+                return;
+            }
+            foregroundFrames = json.frames;
+            foregroundBasePath = json.basePath ? json.basePath.replace(/\/$/, '') + '/' : '';
+        }
+
+        function resolveAtlasPath(frameEntry) {
+            if (typeof frameEntry === 'string') {
+                return frameEntry;
+            }
+            if (frameEntry && frameEntry.atlas) {
+                return frameEntry.atlas;
+            }
+            throw new Error('Each frame entry must be a string or { atlas: "path/to.png" }');
+        }
+
+        function fullFramePath(idx) {
+            const relative = resolveAtlasPath(frames[idx]);
+            return `./assets/${sceneName}/${basePath}${relative}`;
+        }
+
+        function disposeTexture(idx) {
+            const tex = cachedTextures.get(idx);
+            if (tex) {
+                tex.dispose();
+                cachedTextures.delete(idx);
+            }
+        }
+
+        function enforceCacheLimit() {
+            while (lru.length > cacheSize) {
+                const removeIdx = lru.shift();
+                if (removeIdx === undefined || removeIdx === currentFrame || removeIdx === displayedFrameIndex) continue;
+                if (cachedTextures.has(removeIdx)) {
+                    disposeTexture(removeIdx);
+                }
+            }
+        }
+
+        function markAsRecentlyUsed(idx) {
+            const pos = lru.indexOf(idx);
+            if (pos !== -1) {
+                lru.splice(pos, 1);
+            }
+            lru.push(idx);
+        }
+
+        function loadFrameTexture(idx) {
+            if (cachedTextures.has(idx)) {
+                markAsRecentlyUsed(idx);
+                return Promise.resolve(cachedTextures.get(idx));
+            }
+            if (loadingPromises.has(idx)) {
+                return loadingPromises.get(idx);
+            }
+            const promise = new Promise((resolve, reject) => {
+                loader.load(fullFramePath(idx), (texture) => {
+                    texture.minFilter = THREE.LinearFilter;
+                    texture.magFilter = THREE.LinearFilter;
+                    texture.wrapS = THREE.ClampToEdgeWrapping;
+                    texture.wrapT = THREE.ClampToEdgeWrapping;
+                    cachedTextures.set(idx, texture);
+                    markAsRecentlyUsed(idx);
+                    enforceCacheLimit();
+                    loadingPromises.delete(idx);
+                    resolve(texture);
+                }, undefined, (err) => {
+                    loadingPromises.delete(idx);
+                    reject(err);
+                });
+            });
+            loadingPromises.set(idx, promise);
+            return promise;
+        }
+
+        function schedulePrefetch(fromIdx) {
+            const total = frames.length;
+            for (let i = 1; i <= Math.min(cacheSize - 1, total - 1); i++) {
+                const idx = (fromIdx + i) % total;
+                if (!shouldLoop && idx <= fromIdx) {
+                    break;
+                }
+                loadFrameTexture(idx).catch((err) => {
+                    console.warn('Prefetch failed for frame', idx, err);
+                });
+            }
+        }
+
+        function initThree() {
+            const container = document.getElementById('container');
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            container.appendChild(renderer.domElement);
+            document.body.appendChild(VRButton.createButton(renderer));
+
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 0, 0);
+
+            parentGroup = new THREE.Group();
+            scene.add(parentGroup);
+
+            backgroundGroup = buildMpiGroup(1.0);
+            parentGroup.add(backgroundGroup);
+            if (foregroundFrames.length > 0) {
+                foregroundGroup = buildMpiGroup(foregroundDepthScale);
+                parentGroup.add(foregroundGroup);
+            }
+
+            clock = new THREE.Clock();
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function updateStatus(text) {
+            if (statusEl) {
+                statusEl.textContent = text;
+            }
+        }
+
+        function applyTextureToGroup(group, texture) {
+            if (!group) return;
+            group.children.forEach((mesh) => {
+                if (mesh.material && mesh.material.uniforms && mesh.material.uniforms.tColor) {
+                    mesh.material.uniforms.tColor.value = texture;
+                }
+            });
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(() => {
+                const delta = clock.getDelta();
+                if (playbackActive) {
+                    accumulator += delta;
+                    if (accumulator >= frameDuration) {
+                        const steps = Math.floor(accumulator / frameDuration);
+                        accumulator -= steps * frameDuration;
+                        advanceFrame(steps);
+                    }
+                }
+                renderer.render(scene, camera);
+            });
+        }
+
+        function advanceFrame(stepCount) {
+            const total = Math.max(frames.length, foregroundFrames.length);
+            let updated = false;
+            for (let s = 0; s < stepCount; s++) {
+                let nextIndex = currentFrame + frameStep;
+                if (nextIndex >= total) {
+                    if (shouldLoop) {
+                        nextIndex = nextIndex % total;
+                    } else {
+                        playbackActive = false;
+                        updateStatus(`Reached final frame (${currentFrame + 1}/${total})`);
+                        return;
+                    }
+                }
+                currentFrame = nextIndex;
+                updated = true;
+            }
+            if (updated) {
+                const bgPromise = backgroundStatic
+                    ? Promise.resolve(backgroundTexture)
+                    : updateBackgroundTexture(currentFrame);
+                bgPromise.then(() => {
+                    const total = Math.max(frames.length, foregroundFrames.length);
+                    updateStatus(`Frame ${currentFrame + 1}/${total}`);
+                    if (foregroundFrames.length > 0) {
+                        updateForegroundAtlas(currentFrame);
+                    }
+                }).catch((err) => {
+                    console.error('Failed to load frame', currentFrame, err);
+                    updateStatus(`Error: ${err.message}`);
+                });
+                if (!backgroundStatic) {
+                    schedulePrefetch(currentFrame);
+                }
+            }
+        }
+
+        const depths = [
+            100,
+            23.846155,
+            13.537119,
+            9.45122,
+            7.259953,
+            5.893536,
+            4.96,
+            4.281768,
+            3.7667074,
+            3.362256,
+            3.0362391,
+            2.7678573,
+            2.5430682,
+            2.3520486,
+            2.1877205,
+            2.0448549,
+            1.9195048,
+            1.808635,
+            1.7098732,
+            1.6213388,
+            1.5415217,
+            1.4691944,
+            1.40335,
+            1.3431542,
+            1.2879103,
+            1.2370312,
+            1.1900192,
+            1.1464497,
+            1.105958,
+            1.0682288,
+            1.032989,
+            1
+        ];
+
+        function buildMpiGroup(scaleMultiplier) {
+            const height = 5;
+            const baseScale = 3.0;
+            const geom = new THREE.CylinderGeometry(
+                baseScale,
+                baseScale,
+                baseScale * height,
+                360,
+                1,
+                true
+            );
+
+            const group = new THREE.Group();
+            for (let i = 0; i < 32; i++) {
+                const c = i % 4;
+                const r = Math.floor(i / 4);
+                const uvTransform = new THREE.Matrix3();
+                uvTransform.set(
+                    1 / 4, 0, c / 4,
+                    0, 1 / 8, r / 8,
+                    0, 0, 1
+                );
+
+                const mat = new THREE.ShaderMaterial({
+                    side: THREE.BackSide,
+                    uniforms: {
+                        tColor: { value: null },
+                        vUvTransform: { value: uvTransform }
+                    },
+                    vertexShader: document.getElementById('mpiVertexShader').textContent,
+                    fragmentShader: document.getElementById('mpiFragmentShader').textContent,
+                    blending: THREE.CustomBlending,
+                    blendEquation: THREE.AddEquation,
+                    blendSrc: THREE.OneFactor,
+                    blendDst: THREE.OneMinusSrcAlphaFactor,
+                    transparent: true,
+                    depthWrite: false
+                });
+
+                const mesh = new THREE.Mesh(
+                    geom.clone().scale(depths[i] * scaleMultiplier, depths[i] * scaleMultiplier, depths[i] * scaleMultiplier),
+                    mat
+                );
+                mesh.renderOrder = i;
+                group.add(mesh);
+            }
+            return group;
+        }
+
+        function foregroundAtlasPath(idx) {
+            if (!foregroundFrames.length) return null;
+            const target = idx % foregroundFrames.length;
+            const relative = resolveAtlasPath(foregroundFrames[target]);
+            return `./assets/${sceneName}/${foregroundBasePath}${relative}`;
+        }
+
+        function loadForegroundAtlas(idx) {
+            if (!foregroundFrames.length) {
+                return Promise.reject(new Error('No foreground frames'));
+            }
+            const target = idx % foregroundFrames.length;
+            if (foregroundCache.has(target)) {
+                return Promise.resolve(foregroundCache.get(target));
+            }
+            if (foregroundPending.has(target)) {
+                return foregroundPending.get(target);
+            }
+            const path = foregroundAtlasPath(idx);
+            if (!path) {
+                return Promise.reject(new Error('Invalid foreground path'));
+            }
+            const promise = new Promise((resolve, reject) => {
+                loader.load(path, (texture) => {
+                    texture.minFilter = THREE.LinearFilter;
+                    texture.magFilter = THREE.LinearFilter;
+                    foregroundCache.set(target, texture);
+                    foregroundPending.delete(target);
+                    resolve(texture);
+                }, undefined, (err) => {
+                    console.warn('Foreground load failed', idx, err);
+                    foregroundPending.delete(target);
+                    reject(err);
+                });
+            });
+            foregroundPending.set(target, promise);
+            return promise;
+        }
+
+        function updateForegroundAtlas(idx) {
+            loadForegroundAtlas(idx).then((texture) => {
+                if (idx !== currentFrame) return;
+                applyTextureToGroup(foregroundGroup, texture);
+            }).catch(() => { });
+        }
+
+        function updateBackgroundTexture(idx) {
+            const target = Math.min(Math.max(idx, 0), frames.length - 1);
+            if (backgroundStatic && backgroundTexture && target === staticBackgroundIndex) {
+                return Promise.resolve(backgroundTexture);
+            }
+            return loadFrameTexture(target).then((texture) => {
+                if (target !== currentFrame && !backgroundStatic) return texture;
+                applyTextureToGroup(backgroundGroup, texture);
+                displayedFrameIndex = target;
+                if (backgroundStatic) {
+                    backgroundTexture = texture;
+                }
+                return texture;
+            });
+        }
+
+        async function init() {
+            try {
+                await loadManifest();
+                if (foregroundManifestName) {
+                    await loadForegroundManifest();
+                }
+                initThree();
+                currentFrame = Math.min(currentFrame, frames.length - 1);
+                const initIndex = backgroundStatic ? staticBackgroundIndex : currentFrame;
+                await updateBackgroundTexture(initIndex);
+                if (foregroundFrames.length > 0) {
+                    updateForegroundAtlas(currentFrame);
+                }
+                updateStatus(`Frame ${currentFrame + 1}/${frames.length}`);
+                if (!backgroundStatic) {
+                    schedulePrefetch(currentFrame);
+                }
+                animate();
+            } catch (err) {
+                console.error(err);
+                updateStatus(`Error: ${err.message}`);
+            }
+        }
+
+        /**
+         * Manifest format reference (frames_manifest.json):
+         * {
+         *   "basePath": "atlas_frames/",    // optional prefix relative to assets/<scene>/
+         *   "frames": [
+         *      "frame_000000/atlas.png",
+         *      { "atlas": "frame_000001/atlas.png" }
+         *   ]
+         * }
+         */
+
+        init();
+    </script>
+</body>
+
+</html>

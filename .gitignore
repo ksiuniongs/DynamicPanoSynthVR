@@ -131,3 +131,12 @@ dmypy.json
 
 #DS_Store
 .DS_Store
+
+test*
+
+docs/assets*
+
+intermediate
+
+result
+output/

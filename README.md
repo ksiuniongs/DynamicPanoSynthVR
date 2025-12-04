@@ -26,3 +26,15 @@ Run MCI generation only and display output in website using WebXR
   python generate_mci.py --input example.jpg --width 2048 --height 1024 --o outputfolder --s 1
 ```
 docs/assets/matterport2k/0/input.png
+
+http://127.0.0.1:8000/docs/atlas_sequence_viewer.html?scene=campus_run_1024
+
+http://127.0.0.1:8000/docs/atlas_sequence_viewer.html?scene=campus_run_1024_dy&foreground=foreground_rgba&foreground_depth=1.02&bg_static=true
+
+
+http://127.0.0.1:8000/docs/atlas_sequence_viewer.html?scene=campus_run_1024_dy_1_interval_5&foreground=foreground_rgba&foreground_depth=1.0&bg_static=true
+
+http://127.0.0.1:8000/docs/atlas_sequence_viewer.html?scene=campus_run_2048_5&manifest=frames_manifest.json&foreground_manifest=foreground_manifest.json
+
+
+http://localhost:8000/docs/atlas_sequence_viewer.html?scene=my_atlases&manifest=frames_manifest.json&fps=24&loop=true
