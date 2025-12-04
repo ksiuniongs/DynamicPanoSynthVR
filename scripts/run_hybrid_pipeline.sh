@@ -106,6 +106,12 @@ python "$PROJECT_ROOT/main.py" foreground \
     --width $WIDTH --height $HEIGHT \
     --manifest "$WORK_DIR/foreground_manifest.json"
 
+# 修正前景 Manifest 的 basePath
+# 因为前景 Atlas 被移动到了 foreground_atlas 子目录，所以需要更新 manifest
+if [[ -f "$WORK_DIR/foreground_manifest.json" ]]; then
+    sed -i 's/"basePath": ""/"basePath": "foreground_atlas\/"/' "$WORK_DIR/foreground_manifest.json"
+fi
+
 echo "==============================================================="
 echo "[Step 4/4] 部署与索引更新"
 echo "==============================================================="

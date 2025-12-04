@@ -26,12 +26,28 @@
             pointer-events: none;
             user-select: none;
         }
+        #perf-stats {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            color: #0f0;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 6px 10px;
+            font-family: monospace;
+            font-size: 12px;
+            border-radius: 4px;
+            pointer-events: none;
+            user-select: none;
+            text-align: right;
+            white-space: pre;
+        }
     </style>
 </head>
 
 <body>
     <div id="container"></div>
     <div id="status">Loading manifest…</div>
+    <div id="perf-stats">FPS: 0</div>
 
     <script id="mpiVertexShader" type="x-shader/x-vertex">
         varying highp vec2 vUv;
@@ -56,6 +72,7 @@
         import { VRButton } from './assets/js/VRButton.js';
 
         const statusEl = document.getElementById('status');
+        const perfEl = document.getElementById('perf-stats');
 
         function parseQuery() {
             const params = {};
@@ -104,6 +121,11 @@
         let accumulator = 0;
         let playbackActive = true;
 
+        // Performance vars
+        let frameCount = 0;
+        let lastTime = performance.now();
+        let perfAccumulator = 0;
+
         async function loadManifest() {
             const response = await fetch(manifestUrl);
             if (!response.ok) {
@@ -131,6 +153,7 @@
                 return;
             }
             foregroundFrames = json.frames;
+            console.log('Loaded foreground frames:', foregroundFrames.length);
             foregroundBasePath = json.basePath ? json.basePath.replace(/\/$/, '') + '/' : '';
         }
 
@@ -268,7 +291,30 @@
 
         function animate() {
             renderer.setAnimationLoop(() => {
+                const now = performance.now();
                 const delta = clock.getDelta();
+                
+                // Performance stats
+                frameCount++;
+                perfAccumulator += (now - lastTime);
+                lastTime = now;
+
+                if (frameCount >= 30) { // Update every 30 frames
+                    const avgMs = perfAccumulator / frameCount;
+                    const fps = 1000 / avgMs;
+                    let memText = '';
+                    if (performance.memory) {
+                        const usedMB = Math.round(performance.memory.usedJSHeapSize / 1048576);
+                        const limitMB = Math.round(performance.memory.jsHeapSizeLimit / 1048576);
+                        memText = `\nMem: ${usedMB}/${limitMB} MB`;
+                    }
+                    
+                    perfEl.textContent = `FPS: ${Math.round(fps)}\nFrame: ${avgMs.toFixed(1)} ms${memText}`;
+                    
+                    frameCount = 0;
+                    perfAccumulator = 0;
+                }
+
                 if (playbackActive) {
                     accumulator += delta;
                     if (accumulator >= frameDuration) {
@@ -442,10 +488,12 @@
         }
 
         function updateForegroundAtlas(idx) {
+            console.log('Updating foreground atlas for frame:', idx);
             loadForegroundAtlas(idx).then((texture) => {
                 if (idx !== currentFrame) return;
+                console.log('Applying foreground texture for frame:', idx);
                 applyTextureToGroup(foregroundGroup, texture);
-            }).catch(() => { });
+            }).catch((err) => { console.error('Error updating foreground:', err); });
         }
 
         function updateBackgroundTexture(idx) {
