@@ -279,18 +279,10 @@ def save_foreground(frame_bgr: np.ndarray, mask: np.ndarray, path: Path):
     # Ensure mask is single channel
     if len(mask.shape) == 3:
         mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
-        
-    # Normalize alpha to 0-1
-    alpha = mask.astype(np.float32) / 255.0
-    
-    # Convert frame to float
-    frame_float = frame_bgr.astype(np.float32)
-    
-    # Premultiply RGB by Alpha
-    # This darkens the RGB values based on transparency
-    premultiplied = frame_float * alpha[:, :, np.newaxis]
-    
-    # Combine into BGRA
-    bgra = np.dstack((premultiplied, mask)).astype(np.uint8)
-    
+
+    # Keep RGB in straight alpha so we don't double-pre-multiply later
+    fg = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    bgra = cv2.cvtColor(fg, cv2.COLOR_BGR2BGRA)
+    bgra[:, :, 3] = mask
+
     cv2.imwrite(str(path), bgra)

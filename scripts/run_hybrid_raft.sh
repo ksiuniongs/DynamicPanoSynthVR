@@ -40,7 +40,8 @@ fi
 WIDTH=1024
 HEIGHT=512
 # FRAME_INTERVAL is set via argument above
-RAFT_MODEL="$PROJECT_ROOT/submodules/RAFT/models/raft-small.pth"
+# RAFT_MODEL="$PROJECT_ROOT/submodules/RAFT/models/raft-small.pth"
+RAFT_MODEL="$PROJECT_ROOT/submodules/RAFT/models/raft-things.pth"
 WORK_DIR="$PROJECT_ROOT/output/hybrid_output/${SCENE_NAME}"
 ASSET_DIR="$PROJECT_ROOT/docs/assets/${SCENE_NAME}"
 CONDA_ACTIVATE="/home/ksi/miniconda3"

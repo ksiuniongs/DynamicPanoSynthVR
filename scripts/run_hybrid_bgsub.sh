@@ -80,7 +80,7 @@ echo "[Step 2/5] 提取前景 (Background Subtraction)"
 echo "==============================================================="
 # 激活 panosynthvr-py39 环境
 if [ -f "$CONDA_ACTIVATE/bin/activate" ]; then
-    source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+    source "$CONDA_ACTIVATE"/bin/activate nerfstudio
 fi
 
 # 注意: extract 命令会生成 background_frames, masks, foreground_rgba

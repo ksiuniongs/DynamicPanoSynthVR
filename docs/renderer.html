@@ -133,12 +133,23 @@
         (function () { var script = document.createElement('script'); script.onload = function () { var stats = new Stats(); document.body.appendChild(stats.dom); requestAnimationFrame(function loop() { stats.update(); requestAnimationFrame(loop) }); }; script.src = '//mrdoob.github.io/stats.js/build/stats.min.js'; document.head.appendChild(script); })()
     </script>
 
-    <script type="module">
-        var parseQueryString = function () {
+    <div id="perf-stats"
+        style="position: absolute; top: 10px; left: 10px; color: lime; font-family: monospace; font-weight: bold; text-shadow: 1px 1px 1px black; pointer-events: none; white-space: pre;">
+        FPS: 0</div>
+    <button id="perf-download"
+        style="position: absolute; bottom: 12px; right: 12px; padding: 6px 10px; font-family: monospace; font-size: 12px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.3); background: rgba(0, 0, 0, 0.6); color: #fff; cursor: pointer;">Record
+        & Download Stats (10s)</button>
 
+    <script type="module">
+        import * as THREE from './assets/js/three.module.js';
+        import { VRButton } from './assets/js/VRButton.js';
+        import { BufferGeometryUtils } from './assets/js/BufferGeometryUtils.js';
+        import { unzipSync } from './assets/js/fflate.module.min.js';
+        import { Cylinder } from './assets/js/Cylinder.js';
+
+        var parseQueryString = function () {
             var str = window.location.search;
             var objURL = {};
-
             str.replace(
                 new RegExp("([^?=&]+)(=([^&]*))?", "g"),
                 function ($0, $1, $2, $3) {
@@ -148,17 +159,68 @@
             return objURL;
         };
 
-        import * as THREE from './assets/js/three.module.js';
-        import { VRButton } from './assets/js/VRButton.js';
-        import { BufferGeometryUtils } from './assets/js/BufferGeometryUtils.js';
-        import { unzipSync } from './assets/js/fflate.module.min.js';
-        import { Cylinder } from './assets/js/Cylinder.js';
-
         let camera, scene, renderer, sphere, clock;
         let time0 = 0;
         let sequencePlayer = null;
         let videoAtlasResources = null;
         const DEFAULT_ATLAS_FRAMES = 284;
+
+        // Performance Monitoring
+        const perfEl = document.getElementById('perf-stats');
+        const downloadButton = document.getElementById('perf-download');
+        let frameCount = 0;
+        let lastTime = performance.now();
+        let perfAccumulator = 0;
+
+        // Recording State
+        let isRecording = false;
+        let recordingStartTime = 0;
+        let perfSamples = [];
+        const RECORDING_DURATION_MS = 10000; // 10 seconds
+
+        function startRecording() {
+            if (isRecording) return;
+            isRecording = true;
+            recordingStartTime = performance.now();
+            perfSamples = [];
+            downloadButton.textContent = "Recording... (10s)";
+            downloadButton.disabled = true;
+            downloadButton.style.background = "rgba(255, 0, 0, 0.6)";
+        }
+
+        function stopRecordingAndDownload() {
+            isRecording = false;
+            downloadButton.textContent = "Record & Download Stats (10s)";
+            downloadButton.disabled = false;
+            downloadButton.style.background = "rgba(0, 0, 0, 0.6)";
+
+            if (perfSamples.length === 0) return;
+
+            const header = 'timestamp_iso,fps,frame_ms,mem_used_mb,mem_limit_mb\n';
+            const rows = perfSamples.map(sample => {
+                return [
+                    sample.timestamp,
+                    sample.fps.toFixed(2),
+                    sample.frameMs.toFixed(3),
+                    sample.memUsedMB ?? '',
+                    sample.memLimitMB ?? ''
+                ].join(',');
+            });
+            const csv = header + rows.join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `renderer_perf_${Date.now()}.csv`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+        if (downloadButton) {
+            downloadButton.addEventListener('click', startRecording);
+        }
 
         const params = parseQueryString();
         var scale = 3.0;
@@ -1103,6 +1165,58 @@
         }
 
         function render() {
+            const now = performance.now();
+
+            // Performance stats
+            frameCount++;
+            const delta = now - lastTime;
+
+            if (frameCount >= 20) { // Update stats every 20 frames
+                const avgMs = perfAccumulator / frameCount;
+                const fps = 1000 / avgMs;
+
+                let memText = '';
+                let memUsedMB = null;
+                let memLimitMB = null;
+
+                if (performance.memory) {
+                    memUsedMB = Math.round(performance.memory.usedJSHeapSize / 1048576);
+                    memLimitMB = Math.round(performance.memory.jsHeapSizeLimit / 1048576);
+                    memText = `\nMem: ${memUsedMB}/${memLimitMB} MB`;
+                }
+
+                if (perfEl) {
+                    perfEl.textContent = `FPS: ${Math.round(fps)}\nFrame: ${avgMs.toFixed(1)} ms${memText}`;
+                }
+
+                // Recording Logic
+                if (isRecording) {
+                    const elapsedRecording = now - recordingStartTime;
+                    if (elapsedRecording >= RECORDING_DURATION_MS) {
+                        stopRecordingAndDownload();
+                    } else {
+                        perfSamples.push({
+                            timestamp: new Date().toISOString(),
+                            fps: fps,
+                            frameMs: avgMs,
+                            memUsedMB: memUsedMB,
+                            memLimitMB: memLimitMB
+                        });
+                        // Update button text with remaining time
+                        const remaining = Math.ceil((RECORDING_DURATION_MS - elapsedRecording) / 1000);
+                        if (downloadButton) {
+                            downloadButton.textContent = `Recording... (${remaining}s)`;
+                        }
+                    }
+                }
+
+                frameCount = 0;
+                perfAccumulator = 0;
+            }
+
+            lastTime = now;
+            perfAccumulator += delta;
+
             const currentTime = clock.getElapsedTime();
             if (sequencePlayer) {
                 sequencePlayer.update(currentTime);
@@ -1110,17 +1224,11 @@
 
             if (renderer.xr.isPresenting === false) {
                 const elapsed = currentTime - time0;
-
-                /*camera.rotation.y += 0.001;
-                camera.position.x = Math.sin(time) * 0.05;
-                camera.position.z = Math.cos(time) * 0.05;*/
-
                 camera.rotation.y = -elapsed / 10.;
                 camera.position.x = Math.sin(elapsed) / 3;
             }
 
             renderer.render(scene, camera);
-
         }
     </script>
 </body>
