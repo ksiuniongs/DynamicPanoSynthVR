@@ -47,7 +47,31 @@ rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
 
 echo "==============================================================="
-echo "[Step 1/4] RAFT 提取前景与背景 (间隔: ${FRAME_INTERVAL})"
+echo "[Step 1/5] 生成静态背景 (Temporal Median)"
+echo "==============================================================="
+# 激活 panosynthvr-py39 环境
+source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+
+# 创建临时文件夹存放这一张干净的背景图
+TEMP_BG_DIR="$WORK_DIR/temp_static_bg"
+mkdir -p "$TEMP_BG_DIR"
+
+CLEAN_BG_PATH="$TEMP_BG_DIR/frame_000000.png"
+
+# 1. 生成干净背景
+python "$PROJECT_ROOT/main.py" clean_bg \
+    --video "$VIDEO_PATH" \
+    --output "$CLEAN_BG_PATH" \
+    --width $WIDTH --height $HEIGHT \
+    --sample_count 50
+
+if [[ ! -f "$CLEAN_BG_PATH" ]]; then
+    echo "Error: 无法生成干净背景 $CLEAN_BG_PATH"
+    exit 1
+fi
+
+echo "==============================================================="
+echo "[Step 2/5] 提取前景 (RAFT)"
 echo "==============================================================="
 # 激活 nerfstudio 环境用于 RAFT
 source "$CONDA_ACTIVATE"/bin/activate nerfstudio
@@ -61,35 +85,37 @@ python "$PROJECT_ROOT/main.py" extract \
     --raft_model "$RAFT_MODEL" \
     --frame_interval $FRAME_INTERVAL \
     --save_foreground \
-    --mask_threshold 0.2 \
-    --mask_kernel 3 \
+    --mask_threshold 0.5 \
+    --mask_kernel 5 \
     --inpaint_radius 3 \
     --max_frames "$MAX_FRAMES"
 
+# echo "==============================================================="
+# echo "[Step 2/5] 提取前景 (Background Subtraction)"
+# echo "==============================================================="
+# # 激活 panosynthvr-py39 环境
+# source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+# 
+# # 注意: extract 命令会生成 background_frames, masks, foreground_rgba
+# # 使用 background_subtraction 方法，阈值设为 25 (对于 0-255 的像素差)
+# python "$PROJECT_ROOT/main.py" extract \
+#     --video "$VIDEO_PATH" \
+#     --output "$WORK_DIR" \
+#     --width $WIDTH --height $HEIGHT \
+#     --mask_method background_subtraction \
+#     --bg_image "$CLEAN_BG_PATH" \
+#     --frame_interval $FRAME_INTERVAL \
+#     --save_foreground \
+#     --mask_threshold 25 \
+#     --mask_kernel 3 \
+#     --inpaint_radius 3 \
+#     --max_frames "$MAX_FRAMES"
+
 echo "==============================================================="
-echo "[Step 2/4] 生成静态背景 MPI (使用第 ${BG_FRAME_INDEX} 帧)"
+echo "[Step 3/5] 生成静态背景 MPI"
 echo "==============================================================="
-# 激活 panosynthvr-py39 环境用于 MPI 生成
 source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
-
-# 我们只需要处理指定的那一帧背景
-# 为了节省时间，我们创建一个临时的文件夹，只包含那一帧
-TEMP_BG_DIR="$WORK_DIR/temp_static_bg"
-mkdir -p "$TEMP_BG_DIR"
-
-# 找到对应的帧文件 (格式 frame_XXXXXX.png)
-TARGET_FRAME_NAME=$(printf "frame_%06d.png" $BG_FRAME_INDEX)
-SRC_BG_PATH="$WORK_DIR/background_frames/$TARGET_FRAME_NAME"
-
-if [[ ! -f "$SRC_BG_PATH" ]]; then
-    echo "Error: 指定的背景帧 $SRC_BG_PATH 不存在！"
-    echo "请检查 bg_frame_index 是否在提取的帧范围内 (注意 frame_interval)"
-    exit 1
-fi
-
-cp "$SRC_BG_PATH" "$TEMP_BG_DIR/"
-
-# 生成背景 Atlas
+# 使用刚才生成的干净背景作为 MPI 的源
 python "$PROJECT_ROOT/main.py" background \
     --frames_dir "$TEMP_BG_DIR" \
     --output "$WORK_DIR/background_atlas" \
@@ -97,7 +123,7 @@ python "$PROJECT_ROOT/main.py" background \
     --manifest "$WORK_DIR/background_manifest.json"
 
 echo "==============================================================="
-echo "[Step 3/4] 生成动态前景 MPI (所有帧)"
+echo "[Step 4/5] 生成动态前景 MPI"
 echo "==============================================================="
 # 继续使用 panosynthvr-py39 环境
 python "$PROJECT_ROOT/main.py" foreground \
@@ -113,7 +139,7 @@ if [[ -f "$WORK_DIR/foreground_manifest.json" ]]; then
 fi
 
 echo "==============================================================="
-echo "[Step 4/4] 部署与索引更新"
+echo "[Step 5/5] 部署与索引更新"
 echo "==============================================================="
 rm -rf "$ASSET_DIR"
 mkdir -p "$ASSET_DIR"

@@ -18,7 +18,15 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from src.utils import ensure_dir, to_frame_name, discover_frames, write_manifest, to_frame_index
 
 def cmd_extract(args):
-    from src.segmentation import RaftSegmenter, FarnebackSegmenter, clean_mask, inpaint_background, save_foreground
+    from src.segmentation import (
+        RaftSegmenter,
+        FarnebackSegmenter,
+        BackgroundSubtractionSegmenter,
+        LaMaInpainter,
+        clean_mask,
+        inpaint_background,
+        save_foreground,
+    )
     output_dir = Path(args.output)
     bg_dir = output_dir / "background_frames"
     mask_dir = output_dir / "masks"
@@ -46,8 +54,26 @@ def cmd_extract(args):
             mixed_precision=args.mixed_precision,
             alternate_corr=args.alternate_corr,
         )
+    elif args.mask_method == "background_subtraction":
+        if not args.bg_image:
+            raise ValueError("--bg_image is required when mask_method=background_subtraction")
+        bg_img = cv2.imread(args.bg_image)
+        if bg_img is None:
+            raise FileNotFoundError(f"Background image not found: {args.bg_image}")
+        segmenter = BackgroundSubtractionSegmenter(bg_img, args.mask_threshold)
     else:
         segmenter = FarnebackSegmenter(threshold=args.mask_threshold)
+
+    lama_inpainter = None
+    if args.inpaint_method == "lama":
+        if not args.lama_ckpt:
+            raise ValueError("--lama_ckpt is required when inpaint_method=lama")
+        lama_inpainter = LaMaInpainter(
+            repo_path=args.lama_repo,
+            config_path=args.lama_config,
+            checkpoint_path=args.lama_ckpt,
+            device=args.lama_device,
+        )
 
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
@@ -64,75 +90,96 @@ def cmd_extract(args):
     if args.max_frames != -1:
         total_frames = min(total_frames, args.max_frames)
 
-    pbar = tqdm(total=total_frames, unit="frame")
+    from collections import deque
+    
+    # Buffer to store past frames for look-ahead flow computation
+    # We want to compute flow between frame[i] and frame[i + interval]
+    # So we need a buffer of size 'interval'.
+    # When we have 'interval' frames in buffer and read one more (current),
+    # buffer[0] is frame[i] and current is frame[i + interval].
+    frame_buffer = deque()
+    
+    # Pre-fill buffer with first 'interval' frames
+    while len(frame_buffer) < args.frame_interval:
+        if args.max_frames != -1 and frame_idx >= args.max_frames:
+            break
+        
+        # We already read the first frame before the loop
+        if frame_idx == 0:
+            frame_buffer.append((frame_idx, current))
+            frame_idx += 1
+            continue
+            
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if args.width and args.height:
+            frame = cv2.resize(frame, (args.width, args.height))
+        frame_buffer.append((frame_idx, frame))
+        frame_idx += 1
 
-    pending_frame = None
-    last_mask = None
+    # Adjust total frames for progress bar
+    # We only process frames that have a "future" frame 'interval' steps ahead
+    # So we lose the last 'interval' frames.
+    process_total = total_frames - args.frame_interval
+    if process_total < 0: process_total = 0
+    
+    pbar = tqdm(total=process_total, unit="frame")
 
     while True:
         if args.max_frames != -1 and frame_idx >= args.max_frames:
             break
-
-        if frame_idx % args.frame_interval == 0:
-            if pending_frame is None:
-                # First frame encountered (e.g. frame 0)
-                # We defer processing until we have the next frame to compute flow
-                pending_frame = (frame_idx, current.copy())
-            else:
-                # We have a pending frame (prev) and current frame (curr)
-                prev_idx, prev_img = pending_frame
-                
-                # Compute mask for prev_img based on flow to current
-                # flow(prev -> curr) gives a mask aligned with prev
-                mask, flow_max = segmenter.compute_mask(prev_img, current)
-                
-                mask = clean_mask(mask, args.mask_kernel)
-                last_mask = mask
-                
-                # Process and save the PENDING frame
-                background = inpaint_background(prev_img, mask, args.inpaint_radius)
-                frame_name = to_frame_name(prev_idx)
-                
-                cv2.imwrite(str(bg_dir / f"{frame_name}.png"), background)
-                cv2.imwrite(str(mask_dir / f"{frame_name}.png"), mask)
-                if args.save_foreground:
-                    save_foreground(prev_img, mask, fg_dir / f"{frame_name}.png")
-                
-                raw_px = np.count_nonzero(mask)
-                final_px = np.count_nonzero(mask)
-                pbar.set_postfix(max_flow=f"{flow_max:.2f}", raw_px=raw_px, final_px=final_px)
-                
-                # Update pending frame to be the current one
-                pending_frame = (frame_idx, current.copy())
-        
-        pbar.update(1)
-
-        frame_idx += 1
-        ret, next_frame = cap.read()
+            
+        # Read the "future" frame (frame i + interval)
+        ret, future_frame = cap.read()
         if not ret:
             break
-        current = cv2.resize(next_frame, (args.width, args.height))
-
-    # Process the final pending frame if it exists
-    if pending_frame is not None:
-        idx, img = pending_frame
-        if last_mask is None:
-            # Only one frame in video or no flow computed yet
-            mask = np.zeros(img.shape[:2], dtype=np.uint8)
-        else:
-            # Reuse the last known mask for the final frame
-            mask = last_mask
             
-        background = inpaint_background(img, mask, args.inpaint_radius)
-        frame_name = to_frame_name(idx)
+        if args.width and args.height:
+            future_frame = cv2.resize(future_frame, (args.width, args.height))
+            
+        # The frame to process is at the front of the buffer
+        if not frame_buffer:
+            break
+            
+        target_idx, target_img = frame_buffer.popleft()
+        
+        # Add the future frame to buffer (it will be a target later)
+        frame_buffer.append((frame_idx, future_frame))
+        
+        # Compute mask: Flow(target -> future)
+        # target_img is Frame i
+        # future_frame is Frame i + interval
+        mask, flow_max = segmenter.compute_mask(target_img, future_frame)
+        
+        mask = clean_mask(mask, args.mask_kernel)
+        
+        # Inpaint and Save
+        background = inpaint_background(
+            target_img,
+            mask,
+            args.inpaint_radius,
+            method=args.inpaint_method,
+            lama_inpainter=lama_inpainter,
+        )
+        frame_name = to_frame_name(target_idx)
+        
         cv2.imwrite(str(bg_dir / f"{frame_name}.png"), background)
         cv2.imwrite(str(mask_dir / f"{frame_name}.png"), mask)
         if args.save_foreground:
-            save_foreground(img, mask, fg_dir / f"{frame_name}.png")
+            save_foreground(target_img, mask, fg_dir / f"{frame_name}.png")
+        
+        raw_px = np.count_nonzero(mask)
+        final_px = np.count_nonzero(mask)
+        pbar.set_postfix(max_flow=f"{flow_max:.2f}", raw_px=raw_px, final_px=final_px)
+        pbar.update(1)
+        
+        frame_idx += 1
 
     pbar.close()
     cap.release()
-    print(f"Finished extracting {frame_idx} frames into {output_dir}")
+    print(f"Finished extracting frames into {output_dir}")
 
 def cmd_background(args):
     frames_dir = Path(args.frames_dir)
@@ -251,6 +298,73 @@ def cmd_foreground(args):
     if args.manifest:
         write_manifest(output_dir, Path(args.manifest))
 
+def cmd_video_atlas(args):
+    frames_dir = Path(args.frames_dir)
+    if not frames_dir.exists():
+        raise FileNotFoundError(frames_dir)
+
+    frame_dirs = sorted([p for p in frames_dir.iterdir() if p.is_dir() and p.name.startswith("frame_")])
+    if not frame_dirs:
+        raise RuntimeError(f"No frame_* directories found in {frames_dir}")
+
+    if args.max_frames != -1:
+        frame_dirs = frame_dirs[:args.max_frames]
+
+    atlas_paths = [d / "atlas.png" for d in frame_dirs]
+    atlas_paths = [p for p in atlas_paths if p.exists()]
+    if not atlas_paths:
+        raise RuntimeError(f"No atlas.png files found under {frames_dir}")
+
+    first = cv2.imread(str(atlas_paths[0]), cv2.IMREAD_UNCHANGED)
+    if first is None:
+        raise RuntimeError(f"Failed to read {atlas_paths[0]}")
+
+    height, width = first.shape[:2]
+    target_width = width * 2
+
+    fps = args.fps
+    if args.ref_video:
+        cap = cv2.VideoCapture(args.ref_video)
+        if cap.isOpened():
+            ref_fps = cap.get(cv2.CAP_PROP_FPS)
+            if ref_fps and not np.isnan(ref_fps):
+                fps = ref_fps
+                print(f"Using FPS {fps:.4f} from {args.ref_video}")
+            cap.release()
+
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    out = cv2.VideoWriter(args.output, fourcc, fps, (int(target_width), int(height)))
+    if not out.isOpened():
+        print("Failed to open VideoWriter with avc1, falling back to mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(args.output, fourcc, fps, (int(target_width), int(height)))
+    if not out.isOpened():
+        raise RuntimeError("Unable to open VideoWriter with avc1 or mp4v")
+
+    processed = 0
+    for atlas_path in atlas_paths:
+        img = cv2.imread(str(atlas_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"Skipping unreadable atlas: {atlas_path}")
+            continue
+
+        if img.shape[0] != height or img.shape[1] != width:
+            img = cv2.resize(img, (width, height))
+
+        if img.shape[2] == 4:
+            color = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            alpha = img[:, :, 3]
+        else:
+            color = img if img.shape[2] == 3 else cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            alpha = np.full((height, width), 255, dtype=np.uint8)
+        alpha_rgb = cv2.merge([alpha, alpha, alpha])
+        frame = np.concatenate([color, alpha_rgb], axis=1)
+        out.write(frame)
+        processed += 1
+
+    out.release()
+    print(f"Wrote {processed} frames to {args.output} at {fps:.4f} FPS")
+
 from src.generate_index import generate_index
 
 def cmd_index(args):
@@ -272,13 +386,57 @@ def cmd_serve(args):
         except KeyboardInterrupt:
             print("\nServer stopped.")
 
+def cmd_clean_bg(args):
+    print(f"Generating clean background from {args.video}...")
+    cap = cv2.VideoCapture(args.video)
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {args.video}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    # width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    # height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Strategy: Sample N frames evenly distributed across the video
+    # More frames = better result but more memory/time
+    sample_count = args.sample_count
+    indices = np.linspace(0, total_frames - 1, sample_count, dtype=int)
+    
+    frames = []
+    print(f"Sampling {sample_count} frames for median filtering...")
+    
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            # Resize to specified resolution to save memory and match pipeline resolution
+            if args.width and args.height:
+                frame = cv2.resize(frame, (args.width, args.height))
+            frames.append(frame)
+    
+    cap.release()
+
+    if not frames:
+        raise RuntimeError("No frames could be read from the video.")
+
+    print("Computing temporal median (this may take a moment)...")
+    # Stack frames: (N, H, W, 3)
+    stack = np.stack(frames, axis=0)
+    
+    # Compute median along the time axis (axis 0)
+    median_frame = np.median(stack, axis=0).astype(np.uint8)
+    
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(output_path), median_frame)
+    print(f"Success! Clean background saved to: {output_path}")
+
 def main():
     parser = argparse.ArgumentParser(description="PanoSynthVR Pipeline Tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     # Serve
     p_serve = subparsers.add_parser("serve", help="Start local HTTP server")
-    p_serve.add_argument("--port", type=int, default=3600, help="Port number (default: 3600)")
+    p_serve.add_argument("--port", type=int, default=3606, help="Port number (default: 3600)")
 
     # Extract
     p_extract = subparsers.add_parser("extract", help="Extract foreground masks and background frames")
@@ -286,7 +444,8 @@ def main():
     p_extract.add_argument("--output", required=True, help="Output directory")
     p_extract.add_argument("--width", type=int, required=True, help="Processing width")
     p_extract.add_argument("--height", type=int, required=True, help="Processing height")
-    p_extract.add_argument("--mask_method", choices=["raft", "farneback"], default="raft")
+    p_extract.add_argument("--mask_method", choices=["raft", "farneback", "background_subtraction"], default="raft")
+    p_extract.add_argument("--bg_image", help="Path to clean background image for background_subtraction method")
     p_extract.add_argument("--raft_model", help="Path to RAFT checkpoint (.pth)")
     p_extract.add_argument("--mask_threshold", type=float, default=1.5, help="Magnitude threshold for flow mask")
     p_extract.add_argument("--mask_kernel", type=int, default=5, help="Morphology kernel size")
@@ -298,6 +457,31 @@ def main():
     p_extract.add_argument("--alternate_corr", action="store_true", help="Use RAFT alternate correlation")
     p_extract.add_argument("--save_foreground", action="store_true", help="Store RGBA foreground frames")
     p_extract.add_argument("--frame_interval", type=int, default=1, help="Process every Nth frame")
+    p_extract.add_argument(
+        "--inpaint_method",
+        choices=["opencv", "lama"],
+        default="opencv",
+        help="Background inpainting backend (OpenCV Telea or LaMa).",
+    )
+    p_extract.add_argument(
+        "--lama_repo",
+        default=os.path.join("submodules", "lama"),
+        help="Path to the local clone of https://github.com/advimman/lama",
+    )
+    p_extract.add_argument(
+        "--lama_config",
+        default=os.path.join("submodules", "lama", "configs", "prediction", "default.yaml"),
+        help="Path to the LaMa config YAML used for inference.",
+    )
+    p_extract.add_argument(
+        "--lama_ckpt",
+        help="Path to the LaMa checkpoint (.ckpt or .safetensors). Required when --inpaint_method=lama.",
+    )
+    p_extract.add_argument(
+        "--lama_device",
+        default="auto",
+        help="Device for LaMa inference: auto, cpu, cuda, or cuda:N",
+    )
 
     # Background
     p_bg = subparsers.add_parser("background", help="Generate MPI atlas for background frames")
@@ -318,6 +502,22 @@ def main():
     p_fg.add_argument("--max_frames", type=int, default=-1, help="Limit number of frames")
     p_fg.add_argument("--manifest", help="Optional manifest destination path")
 
+    # Video Atlas
+    p_vid = subparsers.add_parser("video_atlas", help="Pack atlas frames into a side-by-side video for renderer mode=video_atlas")
+    p_vid.add_argument("--frames_dir", required=True, help="Directory containing frame_XXXXXX folders with atlas.png")
+    p_vid.add_argument("--output", required=True, help="Output video path (e.g., docs/assets/scene/atlas_video.mp4)")
+    p_vid.add_argument("--fps", type=float, default=24.0, help="Frames per second (default: 24)")
+    p_vid.add_argument("--ref_video", help="Optional source video to copy FPS from")
+    p_vid.add_argument("--max_frames", type=int, default=-1, help="Limit number of atlas frames to encode")
+
+    # Clean Background
+    p_clean = subparsers.add_parser("clean_bg", help="Generate a clean static background using temporal median")
+    p_clean.add_argument("--video", required=True, help="Input video file")
+    p_clean.add_argument("--output", required=True, help="Output path for the clean background image")
+    p_clean.add_argument("--sample_count", type=int, default=50, help="Number of frames to sample for median (default: 50)")
+    p_clean.add_argument("--width", type=int, help="Resize width")
+    p_clean.add_argument("--height", type=int, help="Resize height")
+
     # Index
     p_index = subparsers.add_parser("index", help="Generate index.html with links to all scenes")
 
@@ -329,6 +529,10 @@ def main():
         cmd_background(args)
     elif args.command == "foreground":
         cmd_foreground(args)
+    elif args.command == "video_atlas":
+        cmd_video_atlas(args)
+    elif args.command == "clean_bg":
+        cmd_clean_bg(args)
     elif args.command == "index":
         cmd_index(args)
     elif args.command == "serve":

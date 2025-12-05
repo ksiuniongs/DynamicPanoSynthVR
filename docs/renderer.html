@@ -80,21 +80,22 @@
 
     <script id="videoAtlasFragmentShader" type="x-shader/x-fragment">
             uniform sampler2D tColor;
+            uniform sampler2D tAlpha;
+            uniform int useDualVideo;
             varying highp vec2 vUv;
             void main() {
-                // vUv is in Atlas Space (0..1)
-                // Video is Side-by-Side: [RGB | Alpha]
-                // RGB is at 0.0 .. 0.5
-                // Alpha is at 0.5 .. 1.0
-                
-                vec2 uv_rgb = vec2(vUv.x * 0.5, vUv.y);
-                vec2 uv_alpha = vec2(vUv.x * 0.5 + 0.5, vUv.y);
-                
-                vec4 rgb = texture2D(tColor, uv_rgb);
-                float a = texture2D(tColor, uv_alpha).r; // Use red channel of alpha part
-                
-                gl_FragColor = vec4(rgb.rgb, a);
-                //gl_FragColor = vec4(rgb.rgb, 1.0); // Debug: Ignore alpha
+                vec4 rgbSample;
+                float alphaSample;
+                if (useDualVideo == 1) {
+                    rgbSample = texture2D(tColor, vUv);
+                    alphaSample = texture2D(tAlpha, vUv).r;
+                } else {
+                    vec2 uv_rgb = vec2(vUv.x * 0.5, vUv.y);
+                    vec2 uv_alpha = vec2(vUv.x * 0.5 + 0.5, vUv.y);
+                    rgbSample = texture2D(tColor, uv_rgb);
+                    alphaSample = texture2D(tColor, uv_alpha).r;
+                }
+                gl_FragColor = vec4(rgbSample.rgb, alphaSample);
             }
         </script>
 
@@ -156,6 +157,7 @@
         let camera, scene, renderer, sphere, clock;
         let time0 = 0;
         let sequencePlayer = null;
+        let videoAtlasResources = null;
         const DEFAULT_ATLAS_FRAMES = 284;
 
         const params = parseQueryString();
@@ -178,6 +180,64 @@
             frameLabel: document.getElementById('atlasFrameLabel'),
             metaLabel: document.getElementById('atlasMetaLabel')
         };
+
+        function disposeVideoAtlasResources() {
+            if (!videoAtlasResources) return;
+            if (videoAtlasResources.textures) {
+                videoAtlasResources.textures.forEach((tex) => tex.dispose());
+            }
+            if (videoAtlasResources.videos) {
+                videoAtlasResources.videos.forEach((video) => {
+                    try {
+                        video.pause();
+                        video.src = '';
+                    } catch (e) { }
+                });
+            }
+            videoAtlasResources = null;
+        }
+
+        function loadVideoTexture(path) {
+            return new Promise((resolve, reject) => {
+                const video = document.createElement('video');
+                video.src = path;
+                video.crossOrigin = 'anonymous';
+                video.loop = true;
+                video.muted = true;
+                video.playsInline = true;
+
+                const texture = new THREE.VideoTexture(video);
+                texture.minFilter = THREE.LinearFilter;
+                texture.magFilter = THREE.LinearFilter;
+                texture.format = THREE.RGBFormat;
+
+                const onLoaded = () => {
+                    video.removeEventListener('loadeddata', onLoaded);
+                    video.play().then(() => {
+                        resolve({ video, texture });
+                    }).catch(reject);
+                };
+                const onError = (event) => {
+                    video.removeEventListener('error', onError);
+                    reject(event || new Error('Failed to load video: ' + path));
+                };
+
+                video.addEventListener('loadeddata', onLoaded, { once: true });
+                video.addEventListener('error', onError, { once: true });
+            });
+        }
+
+        function setupVideoAtlasTextures(directory) {
+            const rgbPath = directory + '/atlas_rgb.mp4';
+            const alphaPath = directory + '/atlas_alpha.mp4';
+            return Promise.all([loadVideoTexture(rgbPath), loadVideoTexture(alphaPath)])
+                .then(([rgb, alpha]) => ({ type: 'dual', rgb, alpha }))
+                .catch((err) => {
+                    console.warn('Dual video atlas not available, falling back to legacy atlas_video.mp4', err);
+                    const legacyPath = directory + '/atlas_video.mp4';
+                    return loadVideoTexture(legacyPath).then((legacy) => ({ type: 'legacy', legacy }));
+                });
+        }
 
         const manager = new THREE.LoadingManager();
         const loader = new THREE.TextureLoader(manager);
@@ -282,6 +342,7 @@
                 this.playButton = options.playButton;
                 this.frameLabel = options.frameLabel;
                 this.metaLabel = options.metaLabel;
+                this.buildPathFn = options.buildPathFn;
 
                 this.frameIndex = 0;
                 this.pendingDisplayFrame = 0;
@@ -523,6 +584,9 @@
             }
 
             buildFramePath(index) {
+                if (this.buildPathFn) {
+                    return this.buildPathFn(index, this.directory, this.startFrameNumber, this.framePadding);
+                }
                 const frameNumber = this.startFrameNumber + index;
                 const frameStr = frameNumber.toString().padStart(this.framePadding, '0');
                 return `${this.directory}/frame_${frameStr}.png`;
@@ -567,7 +631,7 @@
                 // Create the panoramic cylinder mesh
                 let cylinder = new THREE.Mesh(cylinderGeom, cylinderMat);
                 parent.add(cylinder);
-            } else if (mode == 'mpi' || mode == 'video_atlas' || mode == 'sequence' || mode == 'atlas4d') {
+            } else if (mode == 'mpi' || mode == 'video_atlas' || mode == 'sequence' || mode == 'atlas4d' || mode == 'hybrid') {
 
                 const cylinderGeom = new THREE.CylinderGeometry(
                     scale,
@@ -578,42 +642,9 @@
                     true
                 );
 
-                /*
-                let cylinderMat = new THREE.ShaderMaterial({
-                    side: THREE.BackSide,
-                    uniforms: { tColor: { value: null } },
-                    vertexShader: document.getElementById('mpiVertexShader').text,
-                    fragmentShader: document.getElementById('mpiFragmentShader').text,
-                    blending: THREE.CustomBlending,
-                    blendEquation: THREE.AddEquation,
-                    blendSrc: THREE.OneFactor, // pre-multiplied alpha
-                    blendDst: THREE.OneMinusSrcAlphaFactor,
-                    transparent: true
-                });
-                */
-
-                //let cylinders = [];
                 for (let i = 0; i < 32; i++) {
                     let c = i % 4;
                     let r = Math.floor(i / 4);
-
-                    /*
-                    let uv_scale = new THREE.Vector2(1./4.,1./8.);
-                    let uv_offset = new THREE.Vector2(c/4.,r/8.);
-
-                    const cylinderGeom = new Cylinder(
-                        scale*depths[i],
-                        scale*height*depths[i],
-                        360,
-                        uv_scale,
-                        uv_offset
-                    );
-                    //cylinders.push(cylinderGeom);
-                    const cylinder = new THREE.Mesh(
-                        cylinderGeom,
-                        cylinderMat
-                    );
-                    */
 
                     var uv_transform = new THREE.Matrix3();
                     uv_transform.set(
@@ -626,33 +657,55 @@
                         fragmentShaderId = 'videoAtlasFragmentShader';
                     }
 
-                    var cylinderMat = new THREE.ShaderMaterial({
+                    // Common material settings
+                    const createMaterial = () => new THREE.ShaderMaterial({
                         side: THREE.BackSide,
-                        uniforms: { tColor: { value: null }, vUvTransform: { value: uv_transform } },
+                        uniforms: {
+                            tColor: { value: null },
+                            vUvTransform: { value: uv_transform }
+                        },
                         vertexShader: document.getElementById('mpiVertexShader').text,
                         fragmentShader: document.getElementById(fragmentShaderId).text,
                         blending: THREE.CustomBlending,
                         blendEquation: THREE.AddEquation,
-                        blendSrc: THREE.OneFactor, // pre-multiplied alpha
+                        blendSrc: THREE.OneFactor,
                         blendDst: THREE.OneMinusSrcAlphaFactor,
-                        transparent: true
+                        transparent: true,
+                        depthWrite: false, // Important for layering
                     });
 
-                    const cylinder = new THREE.Mesh(
-                        cylinderGeom.clone().scale(depths[i], depths[i], depths[i]),
-                        cylinderMat
-                    );
+                    const geom = cylinderGeom.clone().scale(depths[i], depths[i], depths[i]);
 
-                    parent.add(cylinder);
+                    if (mode == 'hybrid') {
+                        // Hybrid Mode: Create TWO meshes per layer
+
+                        // 1. Background Mesh
+                        const bgMat = createMaterial();
+                        const bgMesh = new THREE.Mesh(geom, bgMat);
+                        bgMesh.renderOrder = i * 2; // Even numbers for background
+                        bgMesh.name = `bg_layer_${i}`;
+                        parent.add(bgMesh);
+
+                        // 2. Foreground Mesh
+                        const fgMat = createMaterial();
+                        const fgMesh = new THREE.Mesh(geom, fgMat);
+                        fgMesh.renderOrder = i * 2 + 1; // Odd numbers for foreground, draws AFTER bg
+                        fgMesh.name = `fg_layer_${i}`;
+                        parent.add(fgMesh);
+
+                    } else {
+                        // Standard Mode: Single mesh per layer
+                        const mat = createMaterial();
+                        if (mode == 'video_atlas') {
+                            mat.uniforms.tAlpha = { value: null };
+                            mat.uniforms.useDualVideo = { value: 0 };
+                        }
+
+                        const mesh = new THREE.Mesh(geom, mat);
+                        mesh.renderOrder = i;
+                        parent.add(mesh);
+                    }
                 }
-                /*
-                let merged = BufferGeometryUtils.mergeBufferGeometries(cylinders);
-                const cylinder = new THREE.Mesh(
-                    merged,
-                    cylinderMat
-                );
-                parent.add(cylinder);
-                */
             } else if (mode == 'texarr') {
                 const cylinderGeom = new THREE.CylinderGeometry(
                     scale,
@@ -738,6 +791,7 @@
                 sequencePlayer.dispose();
                 sequencePlayer = null;
             }
+            disposeVideoAtlasResources();
             setSequenceControlsVisible(false);
 
             if (mode == 'plain') {
@@ -775,26 +829,43 @@
                     }
                 );
             } else if (mode == 'video_atlas') {
-                // Load Video Texture
                 let directory = baseDir;
                 if (sceneNum != -1) directory = baseDir + sceneNum.toString();
 
-                const video = document.createElement('video');
-                video.src = directory + '/atlas_video.mp4';
-                video.loop = true;
-                video.muted = true;
-                video.play();
-
-                const texture = new THREE.VideoTexture(video);
-                texture.minFilter = THREE.LinearFilter;
-                texture.magFilter = THREE.LinearFilter;
-                texture.format = THREE.RGBFormat;
-
-                for (let i = 0; i < parent.children.length; i++) {
-                    parent.children[i].material.uniforms.tColor.value = texture;
-                    parent.children[i].material.needsUpdate = true;
-                }
-
+                setupVideoAtlasTextures(directory).then((result) => {
+                    disposeVideoAtlasResources();
+                    if (result.type === 'dual') {
+                        videoAtlasResources = {
+                            videos: [result.rgb.video, result.alpha.video],
+                            textures: [result.rgb.texture, result.alpha.texture]
+                        };
+                        for (let i = 0; i < parent.children.length; i++) {
+                            const uniforms = parent.children[i].material.uniforms;
+                            uniforms.tColor.value = result.rgb.texture;
+                            if (uniforms.tAlpha) {
+                                uniforms.tAlpha.value = result.alpha.texture;
+                                uniforms.useDualVideo.value = 1;
+                            }
+                            parent.children[i].material.needsUpdate = true;
+                        }
+                    } else {
+                        videoAtlasResources = {
+                            videos: [result.legacy.video],
+                            textures: [result.legacy.texture]
+                        };
+                        for (let i = 0; i < parent.children.length; i++) {
+                            const uniforms = parent.children[i].material.uniforms;
+                            uniforms.tColor.value = result.legacy.texture;
+                            if (uniforms.tAlpha) {
+                                uniforms.tAlpha.value = null;
+                                uniforms.useDualVideo.value = 0;
+                            }
+                            parent.children[i].material.needsUpdate = true;
+                        }
+                    }
+                }).catch((err) => {
+                    console.error('Failed to load video atlas textures', err);
+                });
             } else if (mode == 'sequence' || mode == 'atlas4d') {
                 const directory = getSequenceDirectory(sceneNum);
                 let fps = params['fps'] ? parseFloat(params['fps']) : (mode === 'atlas4d' ? 24 : 30);
@@ -863,6 +934,89 @@
                         parent.children[0].material.needsUpdate = true;
                     }
                 );
+            } else if (mode == 'hybrid') {
+                // 1. Load Static Background
+                let directory = baseDir;
+                if (sceneNum != -1) directory = baseDir + sceneNum.toString();
+
+                // Load background atlas (frame_000000/atlas.png)
+                // Note: The hybrid pipeline copies the background frame to assets/scene/frame_000000/atlas.png
+                // But wait, the pipeline copies it to assets/scene/frame_XXXXXX
+                // Let's assume the user passes &bg_frame=0 or we default to frame_000000
+
+                // Actually, the pipeline structure is:
+                // assets/scene/frame_000000/atlas.png (Background)
+                // assets/scene/foreground_atlas/frame_XXXXXX/atlas.png (Foregrounds)
+
+                // Let's load the background first.
+                // We need to find the background meshes.
+
+                const bgFrameName = 'frame_000000'; // Default, or could be param
+                const bgPath = `${directory}/${bgFrameName}/atlas.png`;
+
+                loader.load(bgPath, (texture) => {
+                    texture.minFilter = THREE.LinearFilter;
+                    texture.generateMipmaps = false;
+
+                    parent.children.forEach(child => {
+                        if (child.name.startsWith('bg_layer_')) {
+                            child.material.uniforms.tColor.value = texture;
+                            child.material.needsUpdate = true;
+                        }
+                    });
+                });
+
+                // 2. Setup Dynamic Foreground Sequence
+                const fgDirectory = `${directory}/foreground_atlas`;
+
+                // Re-use sequence logic params
+                let fps = params['fps'] ? parseFloat(params['fps']) : 24;
+                let totalFrames = params['frames'] ? parseInt(params['frames']) : 100;
+                let startFrame = params['start'] ? parseInt(params['start']) : 0;
+                let framePadding = params['pad'] ? parseInt(params['pad']) : 6;
+                let cacheSize = params['cache'] ? parseInt(params['cache']) : 40;
+                const autoPlay = !(params['autoplay'] === '0');
+                const loopPlayback = !(params['loop'] === '0');
+
+                console.log(`Hybrid mode: bg=${bgPath}, fg=${fgDirectory}`);
+
+                // We need a specialized player or modify the existing one to only target fg meshes
+                // Let's modify the existing player to accept a target filter or callback
+
+                // HACK: We can create a "Virtual Parent" that only contains the FG meshes
+                // But AtlasSequencePlayer iterates parent.children.
+                // Let's subclass or modify AtlasSequencePlayer to filter children.
+
+                // Better yet, let's just pass a custom applyTexture callback to the player if we could.
+                // But since I can't easily change the class definition above without re-writing it all,
+                // I will create a temporary "proxy parent" object that has a .children array containing only FG meshes.
+
+                const fgMeshes = parent.children.filter(c => c.name.startsWith('fg_layer_'));
+                const proxyParent = { children: fgMeshes };
+
+                sequencePlayer = new AtlasSequencePlayer({
+                    parent: proxyParent, // Pass the proxy
+                    loader,
+                    directory: fgDirectory,
+                    totalFrames,
+                    fps,
+                    startFrameNumber: startFrame,
+                    framePadding,
+                    autoPlay,
+                    loop: loopPlayback,
+                    maxCacheSize: cacheSize,
+                    slider: sequenceControls.timeline,
+                    playButton: sequenceControls.playButton,
+                    frameLabel: sequenceControls.frameLabel,
+                    metaLabel: sequenceControls.metaLabel,
+                    buildPathFn: (index, directory, startFrame, padding) => {
+                        const frameNumber = startFrame + index;
+                        const frameStr = frameNumber.toString().padStart(padding, '0');
+                        return `${directory}/frame_${frameStr}/atlas.png`;
+                    }
+                });
+                sequencePlayer.init();
+                setSequenceControlsVisible(true);
             }
         }
 

@@ -36,5 +36,8 @@ http://127.0.0.1:8000/docs/atlas_sequence_viewer.html?scene=campus_run_1024_dy_1
 
 http://127.0.0.1:8000/docs/atlas_sequence_viewer.html?scene=campus_run_2048_5&manifest=frames_manifest.json&foreground_manifest=foreground_manifest.json
 
+```
+http://127.0.0.1:3600/docs/renderer.html?mode=video_atlas&scene=-1&name=<scene_name>
+```
 
 http://localhost:8000/docs/atlas_sequence_viewer.html?scene=my_atlases&manifest=frames_manifest.json&fps=24&loop=true

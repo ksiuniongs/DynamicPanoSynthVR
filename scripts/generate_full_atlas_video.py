@@ -48,6 +48,25 @@ def build_atlas(layers, output_width, output_height):
     return atlas
 
 
+def pad_to_multiple(image, multiple=128):
+    """Pad H/W up to the next multiple of `multiple` via reflection."""
+    height, width = image.shape[:2]
+    target_height = int(np.ceil(height / multiple)) * multiple
+    target_width = int(np.ceil(width / multiple)) * multiple
+
+    pad_bottom = target_height - height
+    pad_right = target_width - width
+
+    if pad_bottom or pad_right:
+        image = np.pad(
+            image,
+            ((0, pad_bottom), (0, pad_right), (0, 0)),
+            mode='reflect'
+        )
+
+    return image, pad_bottom, pad_right
+
+
 def process_frame(model, frame_rgb, depths, output_dir, frame_index,
                   output_width, output_height, build_atlas_output=True):
     """Run MPI inference on a single RGB frame."""
@@ -61,12 +80,17 @@ def process_frame(model, frame_rgb, depths, output_dir, frame_index,
     padding = width // 4
     left = input_rgb[:, 0:padding]
     right = input_rgb[:, width - padding:width]
-    input_rgb_padded = np.concatenate((right, input_rgb, left), axis=1)
+    input_rgb_wrapped = np.concatenate((right, input_rgb, left), axis=1)
+
+    # Ensure tensor spatial dims are multiples of 128 for the UNet
+    input_rgb_ready, pad_bottom, pad_right = pad_to_multiple(input_rgb_wrapped, 128)
 
     # Generate MPI layers
-    layers_padded = model(input_rgb_padded[tf.newaxis])[0]
+    layers_padded = model(input_rgb_ready[tf.newaxis])[0]
 
-    # Remove padding
+    # Remove the helper padding and cylindrical wrap
+    if pad_bottom or pad_right:
+        layers_padded = layers_padded[:, :input_rgb_wrapped.shape[0], :input_rgb_wrapped.shape[1], :]
     layers = layers_padded[:, :, padding:-padding, :]
 
     # Disparity map for debugging / inspection

@@ -104,6 +104,111 @@ class RaftSegmenter(MotionSegmenter):
         return mask
 
 
+class LaMaInpainter:
+    """
+    Wrapper around https://github.com/advimman/lama.git for background inpainting.
+    """
+
+    def __init__(self, repo_path: str, config_path: str, checkpoint_path: str, device: str = "auto"):
+        repo_dir = Path(repo_path).expanduser().resolve()
+        if not repo_dir.exists():
+            raise FileNotFoundError(f"LaMa repo not found at {repo_dir}")
+        if str(repo_dir) not in sys.path:
+            sys.path.append(str(repo_dir))
+
+        try:
+            import torch
+            import torch.nn.functional as F
+            from omegaconf import OmegaConf
+            from saicinpainting.training.trainers import load_checkpoint
+        except ImportError as exc:
+            raise ImportError(
+                "Missing LaMa dependencies. Please install torch, omegaconf and "
+                "the saicinpainting package from https://github.com/advimman/lama."
+            ) from exc
+
+        self.torch = torch
+        self.F = F
+        self.OmegaConf = OmegaConf
+        self.load_checkpoint = load_checkpoint
+
+        cfg_path = Path(config_path).expanduser().resolve()
+        ckpt_path = Path(checkpoint_path).expanduser().resolve()
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"LaMa config not found: {cfg_path}")
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"LaMa checkpoint not found: {ckpt_path}")
+
+        torch_device = device
+        if torch_device == "auto":
+            torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(torch_device)
+
+        config = OmegaConf.load(str(cfg_path))
+        if hasattr(config, "training_model"):
+            config.training_model.predict_only = True
+        if hasattr(config, "visualizer"):
+            config.visualizer.kind = "noop"
+
+        self.model = load_checkpoint(config, str(ckpt_path), strict=False, map_location=self.device)
+        self.model.to(self.device)
+        self.model.eval()
+
+        pad_mod = 8
+        data_cfg = getattr(config, "data", None)
+        if data_cfg is not None and hasattr(data_cfg, "pad_out_to_modulo"):
+            pad_mod = int(data_cfg.pad_out_to_modulo)
+        self.pad_mod = pad_mod
+
+    def _pad_tensor(self, tensor, mode="reflect"):
+        _, _, h, w = tensor.shape
+        pad_h = (self.pad_mod - h % self.pad_mod) % self.pad_mod
+        pad_w = (self.pad_mod - w % self.pad_mod) % self.pad_mod
+        if pad_h == 0 and pad_w == 0:
+            return tensor
+        pad = (0, pad_w, 0, pad_h)
+        if mode == "constant":
+            return self.F.pad(tensor, pad, mode="constant", value=0.0)
+        return self.F.pad(tensor, pad, mode=mode)
+
+    def __call__(self, frame_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        if mask is None or mask.max() == 0:
+            return frame_bgr.copy()
+
+        image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        mask_float = (mask > 0).astype(np.float32)
+
+        image_rgb = image_rgb.copy()
+        image_rgb[mask_float > 0] = 0.0
+
+        tensor = self.torch.from_numpy(image_rgb).permute(2, 0, 1).unsqueeze(0)
+        tensor = tensor * 2.0 - 1.0
+        mask_tensor = self.torch.from_numpy(mask_float).unsqueeze(0).unsqueeze(0)
+
+        tensor = self._pad_tensor(tensor, mode="reflect")
+        mask_tensor = self._pad_tensor(mask_tensor, mode="constant")
+
+        batch = {
+            "image": tensor.to(self.device),
+            "mask": mask_tensor.to(self.device),
+        }
+
+        with self.torch.no_grad():
+            batch = self.model(batch)
+
+        prediction = batch.get("inpainted") or batch.get("predicted_image") or batch.get("image")
+        if prediction is None:
+            raise RuntimeError("LaMa model did not return an inpainted tensor.")
+
+        prediction = prediction.detach().cpu()
+        orig_h, orig_w = frame_bgr.shape[:2]
+        prediction = prediction[:, :, :orig_h, :orig_w]
+        prediction = prediction[0].permute(1, 2, 0).numpy()
+        prediction = ((prediction + 1.0) * 0.5).clip(0.0, 1.0)
+        prediction = (prediction * 255.0).astype(np.uint8)
+        return cv2.cvtColor(prediction, cv2.COLOR_RGB2BGR)
+
+
 def clean_mask(mask: np.ndarray, kernel: int) -> np.ndarray:
     if kernel <= 0:
         return mask
@@ -113,9 +218,21 @@ def clean_mask(mask: np.ndarray, kernel: int) -> np.ndarray:
     return closed
 
 
-def inpaint_background(frame_bgr: np.ndarray, mask: np.ndarray, radius: int) -> np.ndarray:
+def inpaint_background(
+    frame_bgr: np.ndarray,
+    mask: np.ndarray,
+    radius: int,
+    method: str = "opencv",
+    lama_inpainter=None,
+) -> np.ndarray:
     if mask.max() == 0:
         return frame_bgr.copy()
+
+    if method == "lama":
+        if lama_inpainter is None:
+            raise ValueError("LaMa inpainting requested but no LaMaInpainter instance was provided.")
+        return lama_inpainter(frame_bgr, mask)
+
     dilated = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
     return cv2.inpaint(frame_bgr, dilated, float(radius), cv2.INPAINT_TELEA)
 
@@ -144,7 +261,35 @@ def main():
     parser.add_argument("--iters", type=int, default=12, help="RAFT inference iterations")
     parser.add_argument("--save_background_frames", action="store_true", help="Export inpainted background frames")
     parser.add_argument("--no_atlas", action="store_true", help="Skip atlas building and only export layers")
+    parser.add_argument(
+        "--inpaint_method",
+        choices=["opencv", "lama"],
+        default="opencv",
+        help="Backend for background inpainting (OpenCV Telea or LaMa).",
+    )
+    parser.add_argument(
+        "--lama_repo",
+        default=os.path.join("submodules", "lama"),
+        help="Path to the local clone of https://github.com/advimman/lama",
+    )
+    parser.add_argument(
+        "--lama_config",
+        default=os.path.join("submodules", "lama", "configs", "prediction", "default.yaml"),
+        help="Path to the LaMa prediction config (.yaml).",
+    )
+    parser.add_argument(
+        "--lama_ckpt",
+        help="Path to the LaMa checkpoint (.ckpt or .safetensors) downloaded from the official repo.",
+    )
+    parser.add_argument(
+        "--lama_device",
+        default="auto",
+        help="Device for LaMa inference: 'auto', 'cpu', 'cuda', or explicit cuda:N.",
+    )
     args = parser.parse_args()
+
+    if args.inpaint_method == "lama" and not args.lama_ckpt:
+        parser.error("--lama_ckpt is required when inpaint_method=lama")
 
     bg_atlas_dir = os.path.join(args.output, "background_atlas")
     fg_dir = os.path.join(args.output, "foreground_rgba")
@@ -166,6 +311,15 @@ def main():
         )
     else:
         segmenter = FarnebackSegmenter(threshold=args.mask_threshold)
+
+    lama_inpainter = None
+    if args.inpaint_method == "lama":
+        lama_inpainter = LaMaInpainter(
+            repo_path=args.lama_repo,
+            config_path=args.lama_config,
+            checkpoint_path=args.lama_ckpt,
+            device=args.lama_device,
+        )
 
     model = load_model()
     depths = mpi.make_depths(1.0, 100.0, 32).numpy()
@@ -191,7 +345,13 @@ def main():
             mask = segmenter.compute_mask(prev_for_mask, current_frame)
             mask = clean_mask(mask, args.mask_kernel)
 
-        background = inpaint_background(current_frame, mask, args.inpaint_radius)
+        background = inpaint_background(
+            current_frame,
+            mask,
+            args.inpaint_radius,
+            method=args.inpaint_method,
+            lama_inpainter=lama_inpainter,
+        )
         if args.save_background_frames:
             cv2.imwrite(os.path.join(bg_frame_dir, f"{to_frame_name(frame_idx)}.png"), background)
 
