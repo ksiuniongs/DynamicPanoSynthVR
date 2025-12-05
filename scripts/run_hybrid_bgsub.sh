@@ -93,7 +93,7 @@ python "$PROJECT_ROOT/main.py" extract \
     --bg_image "$CLEAN_BG_PATH" \
     --frame_interval $FRAME_INTERVAL \
     --save_foreground \
-    --mask_threshold 25 \
+    --mask_threshold 10 \
     --mask_kernel 3 \
     --inpaint_radius 3 \
     --max_frames "$MAX_FRAMES"

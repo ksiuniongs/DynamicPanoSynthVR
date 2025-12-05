@@ -242,6 +242,11 @@
             frameLabel: document.getElementById('atlasFrameLabel'),
             metaLabel: document.getElementById('atlasMetaLabel')
         };
+        const sequenceControlsEnabled = mode !== 'hybrid';
+        if (!sequenceControlsEnabled && sequenceControls.container) {
+            sequenceControls.container.style.display = 'none';
+            sequenceControls.container.setAttribute('aria-hidden', 'true');
+        }
 
         function disposeVideoAtlasResources() {
             if (!videoAtlasResources) return;
@@ -383,6 +388,7 @@
         }
 
         function setSequenceControlsVisible(visible) {
+            if (!sequenceControlsEnabled) return;
             if (!sequenceControls.container) return;
             sequenceControls.container.style.display = visible ? 'flex' : 'none';
             sequenceControls.container.setAttribute('aria-hidden', visible ? 'false' : 'true');
@@ -961,10 +967,10 @@
                     autoPlay,
                     loop: loopPlayback,
                     maxCacheSize: cacheSize,
-                    slider: sequenceControls.timeline,
-                    playButton: sequenceControls.playButton,
-                    frameLabel: sequenceControls.frameLabel,
-                    metaLabel: sequenceControls.metaLabel
+                    slider: sequenceControlsEnabled ? sequenceControls.timeline : null,
+                    playButton: sequenceControlsEnabled ? sequenceControls.playButton : null,
+                    frameLabel: sequenceControlsEnabled ? sequenceControls.frameLabel : null,
+                    metaLabel: sequenceControlsEnabled ? sequenceControls.metaLabel : null
                 });
                 sequencePlayer.init();
                 setSequenceControlsVisible(true);
@@ -1067,10 +1073,10 @@
                     autoPlay,
                     loop: loopPlayback,
                     maxCacheSize: cacheSize,
-                    slider: sequenceControls.timeline,
-                    playButton: sequenceControls.playButton,
-                    frameLabel: sequenceControls.frameLabel,
-                    metaLabel: sequenceControls.metaLabel,
+                    slider: sequenceControlsEnabled ? sequenceControls.timeline : null,
+                    playButton: sequenceControlsEnabled ? sequenceControls.playButton : null,
+                    frameLabel: sequenceControlsEnabled ? sequenceControls.frameLabel : null,
+                    metaLabel: sequenceControlsEnabled ? sequenceControls.metaLabel : null,
                     buildPathFn: (index, directory, startFrame, padding) => {
                         const frameNumber = startFrame + index;
                         const frameStr = frameNumber.toString().padStart(padding, '0');
