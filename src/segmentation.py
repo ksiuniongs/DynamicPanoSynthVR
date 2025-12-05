@@ -253,7 +253,9 @@ def clean_mask(mask: np.ndarray, kernel_size: int) -> np.ndarray:
     kernel = np.ones((kernel_size, kernel_size), np.uint8)
     opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
-    return closed
+    # Erode slightly to remove edge artifacts (black borders)
+    eroded = cv2.erode(closed, kernel, iterations=1)
+    return eroded
 
 def inpaint_background(
     frame_bgr: np.ndarray,
@@ -274,7 +276,21 @@ def inpaint_background(
     return cv2.inpaint(frame_bgr, dilated, float(radius), cv2.INPAINT_TELEA)
 
 def save_foreground(frame_bgr: np.ndarray, mask: np.ndarray, path: Path):
-    fg = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
-    rgba = cv2.cvtColor(fg, cv2.COLOR_BGR2BGRA)
-    rgba[:, :, 3] = mask
-    cv2.imwrite(str(path), rgba)
+    # Ensure mask is single channel
+    if len(mask.shape) == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        
+    # Normalize alpha to 0-1
+    alpha = mask.astype(np.float32) / 255.0
+    
+    # Convert frame to float
+    frame_float = frame_bgr.astype(np.float32)
+    
+    # Premultiply RGB by Alpha
+    # This darkens the RGB values based on transparency
+    premultiplied = frame_float * alpha[:, :, np.newaxis]
+    
+    # Combine into BGRA
+    bgra = np.dstack((premultiplied, mask)).astype(np.uint8)
+    
+    cv2.imwrite(str(path), bgra)

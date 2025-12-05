@@ -41,6 +41,23 @@
             text-align: right;
             white-space: pre;
         }
+        #perf-download {
+            position: absolute;
+            bottom: 12px;
+            right: 12px;
+            padding: 6px 10px;
+            font-family: monospace;
+            font-size: 12px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            background: rgba(0, 0, 0, 0.6);
+            color: #fff;
+            cursor: pointer;
+        }
+        #perf-download:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
     </style>
 </head>
 
@@ -48,6 +65,7 @@
     <div id="container"></div>
     <div id="status">Loading manifest…</div>
     <div id="perf-stats">FPS: 0</div>
+    <button id="perf-download" type="button" disabled>Download stats CSV</button>
 
     <script id="mpiVertexShader" type="x-shader/x-vertex">
         varying highp vec2 vUv;
@@ -73,6 +91,7 @@
 
         const statusEl = document.getElementById('status');
         const perfEl = document.getElementById('perf-stats');
+        const downloadButton = document.getElementById('perf-download');
 
         function parseQuery() {
             const params = {};
@@ -125,6 +144,127 @@
         let frameCount = 0;
         let lastTime = performance.now();
         let perfAccumulator = 0;
+        const perfSamples = [];
+        let gpuAccumulator = 0;
+        let gpuSampleCount = 0;
+        let gpuProfiler = null;
+
+        class GpuProfiler {
+            constructor(rendererInstance) {
+                this.renderer = rendererInstance;
+                this.gl = rendererInstance.getContext();
+                this.isWebGL2 = typeof WebGL2RenderingContext !== 'undefined' &&
+                    this.gl instanceof WebGL2RenderingContext;
+                this.ext = this.isWebGL2
+                    ? this.gl.getExtension('EXT_disjoint_timer_query_webgl2')
+                    : this.gl.getExtension('EXT_disjoint_timer_query');
+                this.supported = !!this.ext;
+                this.pending = [];
+                this.activeQuery = null;
+            }
+
+            beginFrame() {
+                if (!this.supported || this.activeQuery) return;
+                if (this.isWebGL2) {
+                    this.activeQuery = this.gl.createQuery();
+                    this.gl.beginQuery(this.ext.TIME_ELAPSED_EXT, this.activeQuery);
+                } else {
+                    this.activeQuery = this.ext.createQueryEXT();
+                    this.ext.beginQueryEXT(this.ext.TIME_ELAPSED_EXT, this.activeQuery);
+                }
+            }
+
+            endFrame() {
+                if (!this.supported || !this.activeQuery) return;
+                if (this.isWebGL2) {
+                    this.gl.endQuery(this.ext.TIME_ELAPSED_EXT);
+                } else {
+                    this.ext.endQueryEXT(this.ext.TIME_ELAPSED_EXT);
+                }
+                this.pending.push(this.activeQuery);
+                this.activeQuery = null;
+            }
+
+            resolve() {
+                if (!this.supported) return null;
+                while (this.pending.length > 0) {
+                    const query = this.pending[0];
+                    let available;
+                    let disjoint;
+                    if (this.isWebGL2) {
+                        available = this.gl.getQueryParameter(query, this.gl.QUERY_RESULT_AVAILABLE);
+                        disjoint = this.gl.getParameter(this.ext.GPU_DISJOINT_EXT);
+                    } else {
+                        available = this.ext.getQueryObjectEXT(query, this.ext.QUERY_RESULT_AVAILABLE_EXT);
+                        disjoint = this.gl.getParameter(this.ext.GPU_DISJOINT_EXT);
+                    }
+                    if (!available || disjoint) {
+                        if (disjoint) {
+                            this.deleteQuery(query);
+                            this.pending.shift();
+                        }
+                        break;
+                    }
+                    this.pending.shift();
+                    const ns = this.isWebGL2
+                        ? this.gl.getQueryParameter(query, this.gl.QUERY_RESULT)
+                        : this.ext.getQueryObjectEXT(query, this.ext.QUERY_RESULT_EXT);
+                    this.deleteQuery(query);
+                    return ns / 1e6;
+                }
+                return null;
+            }
+
+            deleteQuery(query) {
+                if (!this.supported || !query) return;
+                if (this.isWebGL2) {
+                    this.gl.deleteQuery(query);
+                } else {
+                    this.ext.deleteQueryEXT(query);
+                }
+            }
+        }
+
+        function updateDownloadAvailability() {
+            if (!downloadButton) return;
+            downloadButton.disabled = perfSamples.length === 0;
+        }
+
+        function formatNumber(value, fractionDigits) {
+            if (value === null || value === undefined) return '';
+            return Number(value).toFixed(fractionDigits);
+        }
+
+        function downloadPerfCsv() {
+            if (!perfSamples.length) return;
+            const header = 'timestamp_iso,fps,frame_ms,gpu_ms,gpu_util_percent,mem_used_mb,mem_limit_mb\n';
+            const rows = perfSamples.map(sample => {
+                return [
+                    sample.timestamp,
+                    sample.fps !== null ? sample.fps.toFixed(2) : '',
+                    formatNumber(sample.frameMs, 3),
+                    formatNumber(sample.gpuMs, 3),
+                    formatNumber(sample.gpuUtil, 1),
+                    sample.memUsedMB ?? '',
+                    sample.memLimitMB ?? ''
+                ].join(',');
+            });
+            const csv = header + rows.join('\n');
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `atlas_viewer_perf_${Date.now()}.csv`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }
+
+        if (downloadButton) {
+            downloadButton.addEventListener('click', downloadPerfCsv);
+            updateDownloadAvailability();
+        }
 
         async function loadManifest() {
             const response = await fetch(manifestUrl);
@@ -248,6 +388,7 @@
             renderer.xr.enabled = true;
             container.appendChild(renderer.domElement);
             document.body.appendChild(VRButton.createButton(renderer));
+            gpuProfiler = new GpuProfiler(renderer);
 
             scene = new THREE.Scene();
             camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
@@ -293,26 +434,56 @@
             renderer.setAnimationLoop(() => {
                 const now = performance.now();
                 const delta = clock.getDelta();
+                if (gpuProfiler && gpuProfiler.supported) {
+                    gpuProfiler.beginFrame();
+                }
                 
                 // Performance stats
                 frameCount++;
                 perfAccumulator += (now - lastTime);
                 lastTime = now;
 
+                const gpuResult = gpuProfiler && gpuProfiler.supported ? gpuProfiler.resolve() : null;
+                if (gpuResult !== null) {
+                    gpuAccumulator += gpuResult;
+                    gpuSampleCount++;
+                }
+
                 if (frameCount >= 30) { // Update every 30 frames
                     const avgMs = perfAccumulator / frameCount;
                     const fps = 1000 / avgMs;
                     let memText = '';
+                    let memUsedMB = null;
+                    let memLimitMB = null;
                     if (performance.memory) {
-                        const usedMB = Math.round(performance.memory.usedJSHeapSize / 1048576);
-                        const limitMB = Math.round(performance.memory.jsHeapSizeLimit / 1048576);
-                        memText = `\nMem: ${usedMB}/${limitMB} MB`;
+                        memUsedMB = Math.round(performance.memory.usedJSHeapSize / 1048576);
+                        memLimitMB = Math.round(performance.memory.jsHeapSizeLimit / 1048576);
+                        memText = `\nMem: ${memUsedMB}/${memLimitMB} MB`;
                     }
+                    const avgGpuMs = gpuSampleCount > 0 ? (gpuAccumulator / gpuSampleCount) : null;
+                    const gpuUtil = (avgGpuMs !== null && avgMs > 0)
+                        ? Math.min(100, Math.max(0, (avgGpuMs / avgMs) * 100))
+                        : null;
+                    const gpuText = avgGpuMs !== null
+                        ? `\nGPU: ${avgGpuMs.toFixed(1)} ms${gpuUtil !== null ? ` (${gpuUtil.toFixed(0)}%)` : ''}`
+                        : '\nGPU: n/a';
                     
-                    perfEl.textContent = `FPS: ${Math.round(fps)}\nFrame: ${avgMs.toFixed(1)} ms${memText}`;
+                    perfEl.textContent = `FPS: ${Math.round(fps)}\nFrame: ${avgMs.toFixed(1)} ms${gpuText}${memText}`;
+                    perfSamples.push({
+                        timestamp: new Date().toISOString(),
+                        fps,
+                        frameMs: avgMs,
+                        gpuMs: avgGpuMs,
+                        gpuUtil,
+                        memUsedMB,
+                        memLimitMB
+                    });
+                    updateDownloadAvailability();
                     
                     frameCount = 0;
                     perfAccumulator = 0;
+                    gpuAccumulator = 0;
+                    gpuSampleCount = 0;
                 }
 
                 if (playbackActive) {
@@ -324,6 +495,9 @@
                     }
                 }
                 renderer.render(scene, camera);
+                if (gpuProfiler && gpuProfiler.supported) {
+                    gpuProfiler.endFrame();
+                }
             });
         }
 

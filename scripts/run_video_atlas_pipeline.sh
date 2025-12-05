@@ -30,19 +30,27 @@ if [[ -z "$VIDEO_PATH" ]]; then
 fi
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-WORK_DIR="$PROJECT_ROOT/output/video_atlas/${SCENE_NAME}_${TIMESTAMP}"
+SCENE_OUTPUT_NAME="${SCENE_NAME}_${TIMESTAMP}"
+WORK_DIR="$PROJECT_ROOT/output/video_atlas/${SCENE_OUTPUT_NAME}"
 ATLAS_DIR="$WORK_DIR/frames"
 OUTPUT_VIDEO="$WORK_DIR/atlas_video.mp4"
-ASSET_DIR="$PROJECT_ROOT/docs/assets/${SCENE_NAME}"
+ASSET_DIR="$PROJECT_ROOT/docs/assets/${SCENE_OUTPUT_NAME}"
 CONDA_ACTIVATE="/home/ksi/miniconda3"
 
 rm -rf "$WORK_DIR"
 mkdir -p "$ATLAS_DIR"
 
+# 开始计时
+PIPELINE_START=$(date +%s)
+
 echo "==============================================================="
 echo "[1/3] 生成逐帧 Atlas"
 echo "==============================================================="
-source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+STEP1_START=$(date +%s)
+if [[ -d "$CONDA_ACTIVATE" && -f "$CONDA_ACTIVATE/bin/activate" ]]; then
+    # shellcheck disable=SC1091
+    source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+fi
 python "$PROJECT_ROOT/scripts/generate_full_atlas_video.py" \
     --input "$VIDEO_PATH" \
     --width "$WIDTH" \
@@ -50,9 +58,14 @@ python "$PROJECT_ROOT/scripts/generate_full_atlas_video.py" \
     --output "$ATLAS_DIR" \
     --max_frames "$MAX_FRAMES"
 
+STEP1_END=$(date +%s)
+STEP1_DURATION=$((STEP1_END - STEP1_START))
+echo "✓ Step 1 completed in ${STEP1_DURATION}s"
+
 echo "==============================================================="
 echo "[2/3] 预处理双拼帧并使用 FFmpeg 打包"
 echo "==============================================================="
+STEP2_START=$(date +%s)
 RGB_FRAMES_DIR="$WORK_DIR/rgb_frames"
 ALPHA_FRAMES_DIR="$WORK_DIR/alpha_frames"
 rm -rf "$RGB_FRAMES_DIR" "$ALPHA_FRAMES_DIR"
@@ -115,9 +128,14 @@ $FFMPEG_BIN -y -framerate "$FPS" -i "$ALPHA_FRAMES_DIR/alpha_%06d.png" \
     -c:v libx264 -preset "$FFMPEG_PRESET" -crf "$FFMPEG_CRF" \
     -threads "$FFMPEG_THREADS" -pix_fmt yuv420p "$ALPHA_VIDEO"
 
+STEP2_END=$(date +%s)
+STEP2_DURATION=$((STEP2_END - STEP2_START))
+echo "✓ Step 2 completed in ${STEP2_DURATION}s"
+
 echo "==============================================================="
-echo "[3/3] 拷贝到 docs/assets/${SCENE_NAME}"
+echo "[3/3] 拷贝到 docs/assets/${SCENE_OUTPUT_NAME}"
 echo "==============================================================="
+STEP3_START=$(date +%s)
 rm -rf "$ASSET_DIR"
 mkdir -p "$ASSET_DIR"
 cp "$RGB_VIDEO" "$ASSET_DIR/atlas_rgb.mp4"
@@ -129,8 +147,25 @@ if [[ -n "$FIRST_FRAME_DIR" ]]; then
     cp -r "$FIRST_FRAME_DIR" "$ASSET_DIR/$(basename "$FIRST_FRAME_DIR")"
 fi
 
+STEP3_END=$(date +%s)
+STEP3_DURATION=$((STEP3_END - STEP3_START))
+echo "✓ Step 3 completed in ${STEP3_DURATION}s"
+
+PIPELINE_END=$(date +%s)
+PIPELINE_DURATION=$((PIPELINE_END - PIPELINE_START))
+PIPELINE_MINUTES=$((PIPELINE_DURATION / 60))
+PIPELINE_SECONDS=$((PIPELINE_DURATION % 60))
+
 echo ""
+echo "==============================================================="
 echo "Video atlas generated!"
-echo "Scene: $SCENE_NAME"
-echo "Preview: http://127.0.0.1:3600/docs/renderer.html?mode=video_atlas&scene=-1&name=$SCENE_NAME"
+echo "==============================================================="
+echo "Scene: $SCENE_OUTPUT_NAME"
+echo "Timing:"
+echo "  - Step 1 (Atlas generation): ${STEP1_DURATION}s"
+echo "  - Step 2 (Video encoding):    ${STEP2_DURATION}s"
+echo "  - Step 3 (Asset copy):        ${STEP3_DURATION}s"
+echo "  - Total:                      ${PIPELINE_MINUTES}m ${PIPELINE_SECONDS}s"
+echo ""
+echo "Preview: http://127.0.0.1:3600/docs/renderer.html?mode=video_atlas&scene=-1&name=$SCENE_OUTPUT_NAME"
 echo ""

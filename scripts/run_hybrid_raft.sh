@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # ================================================================
-# Hybrid Pipeline: 
+# Hybrid Pipeline (RAFT): 
 # 1. 视频 -> 抽帧 (间隔 N) -> RAFT 分离前景/背景
-# 2. 背景: 只取指定的一帧 (默认第0帧) 生成静态 MPI Atlas
-# 3. 前景: 所有提取出的前景帧生成动态 MPI Atlas 序列
+# 2. 背景: 使用 Temporal Median 生成的静态背景
+# 3. 前景: RAFT 提取出的前景生成动态 MPI Atlas 序列
 # 4. 自动部署并生成预览链接
 #
 # 用法:
-#   ./scripts/run_hybrid_pipeline.sh <video_path> <scene_name> [bg_frame_index]
+#   ./scripts/run_hybrid_raft.sh <video_path> <scene_name> [bg_frame_index] [max_frames] [frame_interval]
 # ================================================================
 
 set -eo pipefail
@@ -22,7 +22,7 @@ START_TIME=$(date +%s)
 
 # 参数解析
 VIDEO_PATH=${1:-}
-BASE_SCENE_NAME=${2:-hybrid_scene}
+BASE_SCENE_NAME=${2:-hybrid_raft_scene}
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 SCENE_NAME="${BASE_SCENE_NAME}_${TIMESTAMP}"
 BG_FRAME_INDEX=${3:-0}  # 默认使用第0帧作为静态背景
@@ -31,7 +31,7 @@ FRAME_INTERVAL=${5:-5}  # 默认抽帧间隔为5
 
 if [[ -z "$VIDEO_PATH" ]]; then
     echo "Usage: $0 <video_path> <scene_name> [bg_frame_index] [max_frames] [frame_interval]"
-    echo "Example: $0 assets/campus360.mp4 campus_hybrid 0 100 5"
+    echo "Example: $0 assets/campus360.mp4 campus_raft 0 100 5"
     echo "Note: Output will be saved to .../${SCENE_NAME}"
     exit 1
 fi
@@ -53,7 +53,9 @@ echo "==============================================================="
 echo "[Step 1/5] 生成静态背景 (Temporal Median)"
 echo "==============================================================="
 # 激活 panosynthvr-py39 环境
-source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+if [ -f "$CONDA_ACTIVATE/bin/activate" ]; then
+    source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+fi
 
 # 创建临时文件夹存放这一张干净的背景图
 TEMP_BG_DIR="$WORK_DIR/temp_static_bg"
@@ -77,7 +79,9 @@ echo "==============================================================="
 echo "[Step 2/5] 提取前景 (RAFT)"
 echo "==============================================================="
 # 激活 nerfstudio 环境用于 RAFT
-source "$CONDA_ACTIVATE"/bin/activate nerfstudio
+if [ -f "$CONDA_ACTIVATE/bin/activate" ]; then
+    source "$CONDA_ACTIVATE"/bin/activate nerfstudio
+fi
 
 # 注意: extract 命令会生成 background_frames, masks, foreground_rgba
 python "$PROJECT_ROOT/main.py" extract \
@@ -93,31 +97,13 @@ python "$PROJECT_ROOT/main.py" extract \
     --inpaint_radius 3 \
     --max_frames "$MAX_FRAMES"
 
-# echo "==============================================================="
-# echo "[Step 2/5] 提取前景 (Background Subtraction)"
-# echo "==============================================================="
-# # 激活 panosynthvr-py39 环境
-# source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
-# 
-# # 注意: extract 命令会生成 background_frames, masks, foreground_rgba
-# # 使用 background_subtraction 方法，阈值设为 25 (对于 0-255 的像素差)
-# python "$PROJECT_ROOT/main.py" extract \
-#     --video "$VIDEO_PATH" \
-#     --output "$WORK_DIR" \
-#     --width $WIDTH --height $HEIGHT \
-#     --mask_method background_subtraction \
-#     --bg_image "$CLEAN_BG_PATH" \
-#     --frame_interval $FRAME_INTERVAL \
-#     --save_foreground \
-#     --mask_threshold 25 \
-#     --mask_kernel 3 \
-#     --inpaint_radius 3 \
-#     --max_frames "$MAX_FRAMES"
-
 echo "==============================================================="
 echo "[Step 3/5] 生成静态背景 MPI"
 echo "==============================================================="
-source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+if [ -f "$CONDA_ACTIVATE/bin/activate" ]; then
+    source "$CONDA_ACTIVATE"/bin/activate panosynthvr-py39
+fi
+
 # 使用刚才生成的干净背景作为 MPI 的源
 python "$PROJECT_ROOT/main.py" background \
     --frames_dir "$TEMP_BG_DIR" \
@@ -168,13 +154,17 @@ SECONDS=$((DURATION % 60))
 
 TIMESTAMP=$(date +%s)
 
+# 计算实际生成的帧数
+ACTUAL_FRAMES=$(ls "$ASSET_DIR/foreground_atlas" | wc -l)
+
 echo "==============================================================="
-echo "Hybrid Pipeline 完成!"
+echo "Hybrid Pipeline (RAFT) 完成!"
 echo "总耗时: ${HOURS}h ${MINUTES}m ${SECONDS}s"
 echo "==============================================================="
 echo "场景名称: $SCENE_NAME"
 echo "背景帧: #0 (静态)"
 echo "前景: 动态序列 (间隔 $FRAME_INTERVAL)"
+echo "实际生成帧数: $ACTUAL_FRAMES"
 echo ""
-echo "访问地址: http://127.0.0.1:3600/docs/renderer.html?mode=hybrid&name=$SCENE_NAME&frames=$MAX_FRAMES&fps=24&t=$TIMESTAMP"
-echo "注意: 请根据实际生成的帧数调整 URL 中的 frames 参数"
+echo "访问地址: http://127.0.0.1:3600/docs/renderer.html?mode=hybrid&name=$SCENE_NAME&frames=$ACTUAL_FRAMES&fps=24&t=$TIMESTAMP"
+echo "注意: URL 已自动更新为实际帧数 ($ACTUAL_FRAMES)"

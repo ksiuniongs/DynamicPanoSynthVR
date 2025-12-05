@@ -178,6 +178,54 @@ def cmd_extract(args):
         frame_idx += 1
 
     pbar.close()
+    
+    # Fill remaining frames with empty foregrounds
+    # The buffer logic stops when it can't find a future frame, leaving some frames unprocessed.
+    # We need to output them as empty foregrounds to match the expected sequence length.
+    
+    target_end = total_frames
+    if args.max_frames != -1:
+        target_end = min(total_frames, args.max_frames)
+        
+    if frame_idx < target_end:
+        print(f"Filling remaining frames {frame_idx} to {target_end-1} with empty foregrounds...")
+        
+        # We need a reference image size. Use the last processed frame or read from cap if possible.
+        # Since cap might be exhausted or closed, we can use 'current' if available, or create blank.
+        # 'current' holds the last read frame (resized).
+        
+        blank_mask = np.zeros((args.height, args.width), dtype=np.uint8)
+        # For background, we can just use the last known background or the current frame itself.
+        # Let's use the current frame (which is effectively the background since we assume no foreground).
+        
+        while frame_idx < target_end:
+            frame_name = to_frame_name(frame_idx)
+            
+            # For these frames, we assume no foreground movement could be detected
+            # So background = original frame (or we could use the clean background if we had access to it here)
+            # But cmd_extract doesn't know about the clean_bg file unless passed.
+            # However, for the purpose of the pipeline, what matters is the FOREGROUND atlas.
+            # The background atlas is generated separately from clean_bg.
+            # So here we just need to output an empty foreground.
+            
+            # We need an image for save_foreground to work (even if mask is empty).
+            # We can use a black image or the last 'current' frame.
+            dummy_img = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+            
+            # Save empty mask
+            cv2.imwrite(str(mask_dir / f"{frame_name}.png"), blank_mask)
+            
+            # Save empty foreground
+            if args.save_foreground:
+                save_foreground(dummy_img, blank_mask, fg_dir / f"{frame_name}.png")
+                
+            # We also need to save a background frame because the pipeline might expect it
+            # (though the hybrid pipeline uses clean_bg for the static background).
+            # Let's just save the dummy image as background to be safe.
+            cv2.imwrite(str(bg_dir / f"{frame_name}.png"), dummy_img)
+            
+            frame_idx += 1
+
     cap.release()
     print(f"Finished extracting frames into {output_dir}")
 
@@ -436,7 +484,7 @@ def main():
     
     # Serve
     p_serve = subparsers.add_parser("serve", help="Start local HTTP server")
-    p_serve.add_argument("--port", type=int, default=3606, help="Port number (default: 3600)")
+    p_serve.add_argument("--port", type=int, default=3600, help="Port number (default: 3600)")
 
     # Extract
     p_extract = subparsers.add_parser("extract", help="Extract foreground masks and background frames")
